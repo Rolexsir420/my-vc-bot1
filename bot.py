@@ -1046,11 +1046,15 @@ async def poll_muted_users():
                     try:
                         member = await app.get_chat_member(chat_id, user_id)
                         status = member.status
+                        is_restricted_member = (
+                            status == enums.ChatMemberStatus.RESTRICTED
+                            and getattr(member, 'is_member', False)
+                        )
                         if status in [
                             enums.ChatMemberStatus.MEMBER,
                             enums.ChatMemberStatus.ADMINISTRATOR,
                             enums.ChatMemberStatus.OWNER,
-                        ]:
+                        ] or is_restricted_member:
                             try:
                                 user_info = await app.get_users(user_id)
                                 first_name = getattr(user_info, 'first_name', None) or str(user_id)
