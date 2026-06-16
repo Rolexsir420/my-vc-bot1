@@ -245,17 +245,24 @@ async def check_dp_nsfw(user_id):
     tmp_path = None
     try:
         # Download profile photo — Pyrogram 2.x compatible
-        tmp_path = await app.download_media(
-            f"tg://user?id={user_id}",
-            file_name=tempfile.mktemp(suffix=".jpg")
-        )
-        # Fallback: use get_chat to get photo
-        if not tmp_path or not os.path.exists(tmp_path):
+        # Use get_chat_photos which works reliably in Pyrogram 2.x
+        try:
+            photos = []
+            async for photo in app.get_chat_photos(user_id, limit=1):
+                photos.append(photo)
+            if not photos:
+                return False, 0.0, "no_photo"
+            tmp_path = await app.download_media(
+                photos[0],
+                file_name=tempfile.mktemp(suffix=".jpg")
+            )
+        except Exception:
+            # Fallback: use get_chat to get photo
             chat = await app.get_chat(user_id)
             if not chat.photo:
                 return False, 0.0, "no_photo"
             tmp_path = await app.download_media(
-                chat.photo.small_file_id,
+                chat.photo.big_file_id,
                 file_name=tempfile.mktemp(suffix=".jpg")
             )
 
@@ -581,8 +588,21 @@ async def instant_unmute_if_in_vc(chat_id, user_id, first_name, source):
     print(f"⚡ [{source}] {first_name} ({user_id}) joined group!")
     save_group_member(user_id, chat_id)
 
+    # Check cached vc_members first, then do a live VC check as backup
     current_vc = vc_members.get(chat_id, set())
     in_vc = user_id in current_vc
+
+    # If not in cache, do a live VC fetch to catch the case where
+    # poller hasn't updated yet
+    if not in_vc:
+        try:
+            live_vc, _, _ = await get_vc_participants(chat_id)
+            if user_id in live_vc:
+                in_vc = True
+                vc_members[chat_id] = live_vc  # sync cache
+        except Exception as e:
+            print(f"⚠️ Live VC check failed: {e}")
+
     is_muted = user_id in muted_in_vc.get(chat_id, set())
 
     print(f"🔍 In VC: {in_vc} | Muted: {is_muted}")
@@ -591,6 +611,11 @@ async def instant_unmute_if_in_vc(chat_id, user_id, first_name, source):
         print(f"🔊 {first_name} in VC — unmuting instantly!")
         success = await unmute_in_vc(chat_id, user_id)
         if success:
+            await app.send_message(
+                chat_id,
+                f"🔊 **{first_name}** joined the group!\n"
+                f"✅ You can now speak in VC!"
+            )
             await send_log(
                 f"🔊 Auto Unmuted ({source})",
                 first_name, user_id, chat_id,
@@ -1005,6 +1030,11 @@ async def poll_muted_users():
                         print(f"🔄 [POLL] {first_name} ({user_id}) is now a member — unmuting!")
                         success = await unmute_in_vc(chat_id, user_id)
                         if success:
+                            await app.send_message(
+                                chat_id,
+                                f"🔊 **{first_name}** joined the group!\n"
+                                f"✅ You can now speak in VC!"
+                            )
                             await send_log(
                                 "🔊 Auto Unmuted (Poll)",
                                 first_name, user_id, chat_id,
@@ -1034,6 +1064,11 @@ async def poll_muted_users():
                             save_group_member(user_id, chat_id)
                             success = await unmute_in_vc(chat_id, user_id)
                             if success:
+                                await app.send_message(
+                                    chat_id,
+                                    f"🔊 **{first_name}** joined the group!\n"
+                                    f"✅ You can now speak in VC!"
+                                )
                                 await send_log(
                                     "🔊 Auto Unmuted (Poll)",
                                     first_name, user_id, chat_id,
