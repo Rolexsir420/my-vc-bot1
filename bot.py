@@ -30,13 +30,7 @@ SIGHTENGINE_USER   = "1297817509"
 SIGHTENGINE_SECRET = "DfGeVrNhJQJvBBTehCXkmmgPfru47mhv"
 NSFW_THRESHOLD = 0.6
 
-SESSION_STRING = os.environ.get("SESSION_STRING", "")
-app = Client(
-    "vc_moderator",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=SESSION_STRING if SESSION_STRING else None
-)
+app = Client("vc_moderator", api_id=API_ID, api_hash=API_HASH)
 vc_members = {}
 muted_in_vc = {}     # {chat_id: {user_id, ...}}
 vc_channels = {}     # {chat_id: {channel_id, ...}}
@@ -90,8 +84,22 @@ async def get_cached_call(chat_id):
     if (chat_id in call_cache and
             now - call_cache_time.get(chat_id, 0) < CACHE_TTL):
         return call_cache[chat_id]
-    peer = await app.resolve_peer(chat_id)
-    full_chat = await app.invoke(GetFullChannel(channel=peer))
+    try:
+        peer = await app.resolve_peer(chat_id)
+    except (KeyError, ValueError) as e:
+        # Peer not in session cache yet — try get_chat to register it first
+        print(f"⚠️ resolve_peer failed for {chat_id}, re-registering: {e}")
+        try:
+            await app.get_chat(chat_id)
+            peer = await app.resolve_peer(chat_id)
+        except Exception as e2:
+            print(f"❌ Re-register failed: {e2}")
+            return None
+    try:
+        full_chat = await app.invoke(GetFullChannel(channel=peer))
+    except Exception as e:
+        print(f"❌ GetFullChannel error: {e}")
+        return None
     if not full_chat.full_chat.call:
         return None
     call_cache[chat_id] = full_chat.full_chat.call
@@ -212,12 +220,6 @@ async def send_log(action, user_name, user_id, chat_id, reason, warns=None):
     except Exception as e:
         print(f"❌ Log failed: {e}")
 
-def fire_log(action, user_name, user_id, chat_id, reason, warns=None):
-    """Schedule log without awaiting — never blocks the caller."""
-    asyncio.create_task(
-        send_log(action, user_name, user_id, chat_id, reason, warns)
-    )
-
 # ============================================
 # 🔍 BIO CHECK
 # ============================================
@@ -242,16 +244,26 @@ async def check_dp_nsfw(user_id):
     """
     tmp_path = None
     try:
-        # ✅ Correct Pyrogram 2.x way to download profile photo
-        photos = await app.get_profile_photos(user_id, limit=1)
-        if not photos or not photos.photos:
-            return False, 0.0, "no_photo"
-        fd, tmp_path = tempfile.mkstemp(suffix=".jpg")
-        os.close(fd)
-        tmp_path = await app.download_media(
-            photos.photos[0],
-            file_name=tmp_path
-        )
+        # Download profile photo — Pyrogram 2.x compatible
+        try:
+            photos = []
+            async for photo in app.get_chat_photos(user_id, limit=1):
+                photos.append(photo)
+            if not photos:
+                return False, 0.0, "no_photo"
+            tmp_path = await app.download_media(
+                photos[0],
+                file_name=tempfile.mktemp(suffix=".jpg")
+            )
+        except Exception:
+            chat = await app.get_chat(user_id)
+            if not chat.photo:
+                return False, 0.0, "no_photo"
+            tmp_path = await app.download_media(
+                chat.photo.big_file_id,
+                file_name=tempfile.mktemp(suffix=".jpg")
+            )
+
         if not tmp_path or not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
             return False, 0.0, "download_failed"
 
@@ -313,15 +325,12 @@ async def send_dp_review(chat_id, user_id, first_name, score, label):
         # Pyrogram 2.x compatible photo download
         tmp_path = None
         try:
-            # ✅ Correct Pyrogram 2.x way to download profile photo
-            photos = await app.get_profile_photos(user_id, limit=1)
-            if not photos or not photos.photos:
+            chat = await app.get_chat(user_id)
+            if not chat.photo:
                 return
-            fd, tmp_path = tempfile.mkstemp(suffix=".jpg")
-            os.close(fd)
             tmp_path = await app.download_media(
-                photos.photos[0],
-                file_name=tmp_path
+                chat.photo.small_file_id,
+                file_name=tempfile.mktemp(suffix=".jpg")
             )
         except Exception:
             return
@@ -587,11 +596,6 @@ async def instant_unmute_if_in_vc(chat_id, user_id, first_name, source):
         print(f"🔊 {first_name} in VC — unmuting instantly!")
         success = await unmute_in_vc(chat_id, user_id)
         if success:
-            await app.send_message(
-                chat_id,
-                f"🔊 **{first_name}** joined the group!\n"
-                f"✅ You can now speak in VC!"
-            )
             await send_log(
                 f"🔊 Auto Unmuted ({source})",
                 first_name, user_id, chat_id,
@@ -695,12 +699,14 @@ async def admin_unmute(client, message):
 
     success = await unmute_in_vc(chat_id, user_id)
     if success:
+        await message.reply(f"🔊 **{first_name}** has been unmuted by admin.")
         await send_log(
             "🔊 Admin Unmuted",
             first_name, user_id, chat_id,
             f"Manually unmuted by {message.from_user.first_name} ({message.from_user.id})"
         )
-
+    else:
+        await message.reply(f"⚠️ Could not unmute **{first_name}** — they may not be in VC.")
 @app.on_message(filters.left_chat_member)
 async def handle_left_group_member(client, message):
     chat_id = message.chat.id
@@ -812,6 +818,11 @@ async def handle_channel_vc_join(chat_id, channel_id):
             channel_info = None
 
         print(f"📢 Channel joined VC: {channel_name} ({channel_id})")
+
+        # ✅ Skip whitelisted channels (owner's own channels)
+        if channel_id in ALLOWED_CHANNELS:
+            print(f"⏭️ Channel {channel_name} is whitelisted — skipping!")
+            return
 
         banned = False
         kicked = False
@@ -1010,11 +1021,15 @@ async def poll_muted_users():
                     try:
                         member = await app.get_chat_member(chat_id, user_id)
                         status = member.status
+                        is_restricted_member = (
+                            status == enums.ChatMemberStatus.RESTRICTED
+                            and getattr(member, 'is_member', False)
+                        )
                         if status in [
                             enums.ChatMemberStatus.MEMBER,
                             enums.ChatMemberStatus.ADMINISTRATOR,
                             enums.ChatMemberStatus.OWNER,
-                        ]:
+                        ] or is_restricted_member:
                             try:
                                 user_info = await app.get_users(user_id)
                                 first_name = getattr(user_info, 'first_name', None) or str(user_id)
@@ -1048,12 +1063,16 @@ async def main():
     print(f"✅ Bot is running!")
     print(f"✅ Monitoring: {ALLOWED_GROUPS}")
 
-    # ✅ RAILWAY FIX — register group peers before polling
+    # ✅ RAILWAY FIX — force-register all group peers into session cache
+    # Without this, resolve_peer(-100xxx) fails with "Peer id invalid"
+    # because a fresh/uploaded session has no peer info for groups it
+    # hasn't seen yet in THIS environment.
     print("🔄 Registering group peers...")
     for chat_id in ALLOWED_GROUPS:
         for attempt in range(5):
             try:
                 chat_info = await app.get_chat(chat_id)
+                # Also join the update feed for this chat
                 await app.invoke(
                     GetFullChannel(channel=await app.resolve_peer(chat_id))
                 )
