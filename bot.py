@@ -30,7 +30,13 @@ SIGHTENGINE_USER   = "1297817509"
 SIGHTENGINE_SECRET = "DfGeVrNhJQJvBBTehCXkmmgPfru47mhv"
 NSFW_THRESHOLD = 0.6
 
-app = Client("vc_moderator", api_id=API_ID, api_hash=API_HASH)
+SESSION_STRING = os.environ.get("SESSION_STRING", "")
+app = Client(
+    "vc_moderator",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    session_string=SESSION_STRING if SESSION_STRING else None
+)
 vc_members = {}
 muted_in_vc = {}     # {chat_id: {user_id, ...}}
 vc_channels = {}     # {chat_id: {channel_id, ...}}
