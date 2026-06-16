@@ -611,11 +611,6 @@ async def instant_unmute_if_in_vc(chat_id, user_id, first_name, source):
         print(f"🔊 {first_name} in VC — unmuting instantly!")
         success = await unmute_in_vc(chat_id, user_id)
         if success:
-            await app.send_message(
-                chat_id,
-                f"🔊 **{first_name}** joined the group!\n"
-                f"✅ You can now speak in VC!"
-            )
             await send_log(
                 f"🔊 Auto Unmuted ({source})",
                 first_name, user_id, chat_id,
@@ -1030,11 +1025,6 @@ async def poll_muted_users():
                         print(f"🔄 [POLL] {first_name} ({user_id}) is now a member — unmuting!")
                         success = await unmute_in_vc(chat_id, user_id)
                         if success:
-                            await app.send_message(
-                                chat_id,
-                                f"🔊 **{first_name}** joined the group!\n"
-                                f"✅ You can now speak in VC!"
-                            )
                             await send_log(
                                 "🔊 Auto Unmuted (Poll)",
                                 first_name, user_id, chat_id,
