@@ -19,12 +19,12 @@ def now_ist():
 # --- FILL THESE ---
 API_ID = 38524810
 API_HASH = "af88419ea0782d5644f2dbe7e3561ae2"
-LOG_CHANNEL = -1003840632852   # ← Replace with your private log channel ID (e.g. -1001987654321)
+LOG_CHANNEL = -1003840632852
 OWNER_ID = 8834161906
 ALLOWED_GROUPS = [-1002483433187]
 ALLOWED_CHANNELS = []
 
-# --- SIGHTENGINE (free tier: sightengine.com) ---
+# --- SIGHTENGINE ---
 SIGHTENGINE_USER   = "1297817509"
 SIGHTENGINE_SECRET = "DfGeVrNhJQJvBBTehCXkmmgPfru47mhv"
 NSFW_THRESHOLD = 0.6
@@ -64,7 +64,7 @@ _pyro_client.Client.handle_updates = _patched_handle_updates
 # ============================================
 call_cache = {}
 call_cache_time = {}
-CACHE_TTL = 30  # seconds
+CACHE_TTL = 30
 
 async def get_cached_call(chat_id):
     now = asyncio.get_event_loop().time()
@@ -184,7 +184,7 @@ def is_known_member(user_id, chat_id):
     return result is not None
 
 # ============================================
-# 📋 LOG  — no IST time, clickable user name
+# 📋 LOG
 # ============================================
 async def send_log(action, user_name, user_id, chat_id, reason, warns=None):
     warn_line = f"⚠️ **Warnings:** `{warns}/3`\n" if warns else ""
@@ -204,7 +204,6 @@ async def send_log(action, user_name, user_id, chat_id, reason, warns=None):
     except Exception as e:
         print(f"❌ Log failed: {e}")
 
-# helper so existing callers that used fire_log still work
 def fire_log(action, user_name, user_id, chat_id, reason, warns=None):
     asyncio.create_task(send_log(action, user_name, user_id, chat_id, reason, warns))
 
@@ -219,7 +218,7 @@ def has_group_link(bio):
     ))
 
 # ============================================
-# 🖼️ NSFW DP CHECK — Sightengine API
+# 🖼️ NSFW DP CHECK
 # ============================================
 async def check_dp_nsfw(user_id):
     tmp_path = None
@@ -996,7 +995,17 @@ async def main():
     print(f"✅ Bot is running!")
     print(f"✅ Monitoring: {ALLOWED_GROUPS}")
 
-    # ✅ Register all group peers into session cache
+    # ============================================
+    # ✅ PERMANENT FIX — Load ALL dialogs first
+    # This caches every chat peer including private
+    # log channel — fixes "Peer id invalid" forever
+    # ============================================
+    print("🔄 Loading all dialogs to cache peers...")
+    async for _ in app.get_dialogs():
+        pass
+    print("✅ All peers cached!")
+
+    # ✅ Register group peers
     print("🔄 Registering group peers...")
     for chat_id in ALLOWED_GROUPS:
         for attempt in range(5):
@@ -1011,7 +1020,7 @@ async def main():
                 print(f"⚠️ Peer register attempt {attempt+1}/5 for {chat_id}: {e}")
                 await asyncio.sleep(2)
 
-    # ✅ Register log channel peer — fixes "PeerGroup" error on Railway
+    # ✅ Register log channel peer
     print("🔄 Registering log channel peer...")
     for attempt in range(5):
         try:
@@ -1024,6 +1033,7 @@ async def main():
 
     try:
         await app.send_message(LOG_CHANNEL, "✅ **VC Bot Started!** Now monitoring.")
+        print("✅ Startup message sent to log channel!")
     except Exception as e:
         print(f"⚠️ Startup message error: {e}")
 
