@@ -25,43 +25,30 @@ ALLOWED_GROUPS = [-1002483433187]
 ALLOWED_CHANNELS = []
 
 # --- SIGHTENGINE (free tier: sightengine.com) ---
-# Sign up free at sightengine.com → Dashboard → copy api_user and api_secret
 SIGHTENGINE_USER   = "1297817509"
 SIGHTENGINE_SECRET = "DfGeVrNhJQJvBBTehCXkmmgPfru47mhv"
 NSFW_THRESHOLD = 0.6
 
-import os
-SESSION_STRING = os.environ.get("SESSION_STRING", "")
-if SESSION_STRING:
-    app = Client("vc_moderator", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
-else:
-    app = Client("vc_moderator", api_id=API_ID, api_hash=API_HASH)
+SESSION_STRING = os.environ.get("SESSION_STRING")
+if not SESSION_STRING:
+    raise ValueError("SESSION_STRING environment variable is not set!")
+
+app = Client(
+    "vc_moderator",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    session_string=SESSION_STRING
+)
+
 vc_members = {}
-muted_in_vc = {}     # {chat_id: {user_id, ...}}
-vc_channels = {}     # {chat_id: {channel_id, ...}}
-vc_video_users = {}  # {chat_id: {user_id, ...}} — users with camera/screenshare ON
-video_muted = {}     # {chat_id: {user_id, ...}} — muted specifically for camera/screenshare, only admin can unmute
+muted_in_vc = {}
+vc_channels = {}
+vc_video_users = {}
+video_muted = {}
 
 # ============================================
 # 🛡️ PYROGRAM BUG FIX
-# Pyrogram 2.x crashes handle_updates() with
-# "Peer id invalid" when it receives any update
-# from a chat not in its session cache (e.g. a
-# linked discussion group). This kills ALL event
-# handlers silently — including on_chat_member_updated.
-# Fix: patch resolve_peer to return None for unknown
-# peers instead of raising, so handle_updates survives.
 # ============================================
-_original_resolve_peer = app.resolve_peer.__func__ if hasattr(app.resolve_peer, '__func__') else None
-
-async def _safe_resolve_peer(self, peer_id):
-    try:
-        return await type(app).resolve_peer(self, peer_id)
-    except (KeyError, ValueError) as e:
-        if "Peer id invalid" in str(e) or "ID not found" in str(e):
-            return None
-        raise
-
 import pyrogram.client as _pyro_client
 _orig_handle_updates = _pyro_client.Client.handle_updates
 
@@ -70,19 +57,18 @@ async def _patched_handle_updates(self, updates):
         await _orig_handle_updates(self, updates)
     except (ValueError, KeyError) as e:
         if "Peer id invalid" in str(e) or "ID not found" in str(e):
-            pass  # Silently drop — unknown chat, not our group
+            pass
         else:
             raise
 
 _pyro_client.Client.handle_updates = _patched_handle_updates
-# ============================================
 
 # ============================================
-# 🚀 CALL CACHE — avoids repeated GetFullChannel
+# 🚀 CALL CACHE
 # ============================================
 call_cache = {}
 call_cache_time = {}
-CACHE_TTL = 30  # seconds
+CACHE_TTL = 30
 
 async def get_cached_call(chat_id):
     now = asyncio.get_event_loop().time()
@@ -92,7 +78,6 @@ async def get_cached_call(chat_id):
     try:
         peer = await app.resolve_peer(chat_id)
     except (KeyError, ValueError) as e:
-        # Peer not in session cache yet — try get_chat to register it first
         print(f"⚠️ resolve_peer failed for {chat_id}, re-registering: {e}")
         try:
             await app.get_chat(chat_id)
@@ -203,16 +188,14 @@ def is_known_member(user_id, chat_id):
     return result is not None
 
 # ============================================
-# 📋 LOG
+# 📋 LOG — clickable name, no IST time
 # ============================================
 async def send_log(action, user_name, user_id, chat_id, reason, warns=None):
-    now = now_ist()
     warn_line = f"⚠️ **Warnings:** `{warns}/3`\n" if warns else ""
     text = (
         f"📋 **VC BOT LOG**\n"
         f"━━━━━━━━━━━━━━━━\n"
-        f"🕐 **Time (IST):** `{now}`\n"
-        f"👤 **User:** {user_name} (`{user_id}`)\n"
+        f"👤 **User:** [{user_name}](tg://user?id={user_id}) (`{user_id}`)\n"
         f"👥 **Group:** `{chat_id}`\n"
         f"⚡ **Action:** {action}\n"
         f"📝 **Reason:** {reason}\n"
@@ -224,6 +207,9 @@ async def send_log(action, user_name, user_id, chat_id, reason, warns=None):
         print(f"✅ Log sent: {action} | {user_name}")
     except Exception as e:
         print(f"❌ Log failed: {e}")
+
+def fire_log(action, user_name, user_id, chat_id, reason, warns=None):
+    asyncio.create_task(send_log(action, user_name, user_id, chat_id, reason, warns))
 
 # ============================================
 # 🔍 BIO CHECK
@@ -237,19 +223,10 @@ def has_group_link(bio):
 
 # ============================================
 # 🖼️ NSFW DP CHECK — Sightengine API
-# Downloads profile photo → checks via API →
-# Only suspicious DPs go to admin review
-# Clean DPs: silently pass, no admin ping
 # ============================================
 async def check_dp_nsfw(user_id):
-    """
-    Returns (is_suspicious: bool, score: float, label: str)
-    score = highest NSFW score found (0.0–1.0)
-    label = what type was detected
-    """
     tmp_path = None
     try:
-        # Download profile photo — Pyrogram 2.x compatible
         try:
             photos = []
             async for photo in app.get_chat_photos(user_id, limit=1):
@@ -272,7 +249,6 @@ async def check_dp_nsfw(user_id):
         if not tmp_path or not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
             return False, 0.0, "download_failed"
 
-        # Send to Sightengine for moderation
         async with aiohttp.ClientSession() as session:
             with open(tmp_path, "rb") as img_file:
                 form = aiohttp.FormData()
@@ -290,11 +266,9 @@ async def check_dp_nsfw(user_id):
                         return False, 0.0, "api_error"
                     data = await resp.json()
 
-        # Parse scores from response
         scores = {}
         try:
             nudity = data.get("nudity", {})
-            # nudity-2.0 model returns these fields
             scores["sexual_explicit"] = nudity.get("sexual_activity", 0) or nudity.get("explicit", 0) or 0
             scores["suggestive"]      = nudity.get("suggestive", 0) or nudity.get("suggestive_classes", {}).get("bikini", 0) or 0
             scores["very_suggestive"] = nudity.get("very_suggestive", 0) or 0
@@ -316,7 +290,6 @@ async def check_dp_nsfw(user_id):
         print(f"❌ NSFW check error for {user_id}: {e}")
         return False, 0.0, "exception"
     finally:
-        # Always clean up temp file
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
@@ -325,9 +298,7 @@ async def check_dp_nsfw(user_id):
 
 
 async def send_dp_review(chat_id, user_id, first_name, score, label):
-    """Send suspicious DP to log channel with Ban / Clear buttons."""
     try:
-        # Pyrogram 2.x compatible photo download
         tmp_path = None
         try:
             chat = await app.get_chat(user_id)
@@ -349,7 +320,6 @@ async def send_dp_review(chat_id, user_id, first_name, score, label):
             f"━━━━━━━━━━━━━━━━\n"
             f"👤 **User:** [{first_name}](tg://user?id={user_id}) (`{user_id}`)\n"
             f"👥 **Group:** `{chat_id}`\n"
-            f"🕐 **Time (IST):** `{now_ist()}`\n"
             f"⚠️ **Type:** `{label_display}`\n"
             f"📊 **Score:** `{score}` / `1.0` (threshold: `{NSFW_THRESHOLD}`)\n"
             f"━━━━━━━━━━━━━━━━\n"
@@ -390,13 +360,12 @@ async def send_dp_review(chat_id, user_id, first_name, score, label):
 @app.on_callback_query(filters.regex(r"^dp(ban|clear)_(-?\d+)_(\d+)$"))
 async def dp_review_callback(client, callback_query):
     try:
-        action   = callback_query.matches[0].group(1)   # "ban" or "clear"
+        action   = callback_query.matches[0].group(1)
         chat_id  = int(callback_query.matches[0].group(2))
         user_id  = int(callback_query.matches[0].group(3))
         admin    = callback_query.from_user
         admin_name = admin.first_name or str(admin.id)
 
-        # Only allow group admins or owner to action
         try:
             admin_member = await app.get_chat_member(chat_id, admin.id)
             if admin_member.status not in [
@@ -423,7 +392,6 @@ async def dp_review_callback(client, callback_query):
                     f"🚫 **Banned by admin**\n"
                     f"👤 User: [{first_name}](tg://user?id={user_id}) (`{user_id}`)\n"
                     f"👮 Admin: {admin_name} (`{admin.id}`)\n"
-                    f"🕐 Time: `{now_ist()}`"
                 )
                 fire_log(
                     "🚫 Banned (NSFW DP — Admin Action)",
@@ -445,7 +413,6 @@ async def dp_review_callback(client, callback_query):
                 f"✅ **Cleared by admin — Not NSFW**\n"
                 f"👤 User: [{first_name}](tg://user?id={user_id}) (`{user_id}`)\n"
                 f"👮 Admin: {admin_name} (`{admin.id}`)\n"
-                f"🕐 Time: `{now_ist()}`"
             )
             await callback_query.answer("✅ Cleared!", show_alert=True)
 
@@ -458,8 +425,6 @@ async def dp_review_callback(client, callback_query):
 # 🎙️ GET VC PARTICIPANTS
 # ============================================
 async def get_vc_participants(chat_id):
-    """Returns (user_ids: set, channel_ids: set, video_users: set)
-    video_users = users who have camera OR screenshare active"""
     try:
         call = await get_cached_call(chat_id)
         if not call:
@@ -475,7 +440,6 @@ async def get_vc_participants(chat_id):
             if hasattr(p.peer, 'user_id'):
                 uid = p.peer.user_id
                 user_ids.add(uid)
-                # p.video = camera on, p.presentation = screenshare on
                 if p.video or p.presentation:
                     video_users.add(uid)
             elif hasattr(p.peer, 'channel_id'):
@@ -488,7 +452,7 @@ async def get_vc_participants(chat_id):
         return set(), set(), set()
 
 # ============================================
-# 🔇 MUTE IN VC — uses cached call
+# 🔇 MUTE IN VC
 # ============================================
 async def mute_in_vc(chat_id, user_id):
     for attempt in range(3):
@@ -519,7 +483,7 @@ async def mute_in_vc(chat_id, user_id):
     return False
 
 # ============================================
-# 🔊 UNMUTE IN VC — uses cached call
+# 🔊 UNMUTE IN VC
 # ============================================
 async def unmute_in_vc(chat_id, user_id):
     for attempt in range(3):
@@ -584,8 +548,7 @@ async def is_real_member(chat_id, user_id):
         return is_known_member(user_id, chat_id)
 
 # ============================================
-# ⚡ INSTANT UNMUTE — called when user joins group
-# Trusts the join event 100% — NO extra API check!
+# ⚡ INSTANT UNMUTE
 # ============================================
 async def instant_unmute_if_in_vc(chat_id, user_id, first_name, source):
     print(f"⚡ [{source}] {first_name} ({user_id}) joined group!")
@@ -611,7 +574,6 @@ async def instant_unmute_if_in_vc(chat_id, user_id, first_name, source):
 
 # ============================================
 # 🔄 HANDLER 1: on_chat_member_updated
-# Fires instantly when user joins group
 # ============================================
 @app.on_chat_member_updated()
 async def on_member_update(client, update):
@@ -648,7 +610,6 @@ async def on_member_update(client, update):
 
 # ============================================
 # 🔄 HANDLER 2: new_chat_members message
-# Backup for Handler 1
 # ============================================
 @app.on_message(filters.new_chat_members)
 async def handle_new_group_member(client, message):
@@ -670,8 +631,6 @@ async def handle_new_group_member(client, message):
 
 # ============================================
 # 🔊 ADMIN UNMUTE COMMAND
-# Usage: reply to a user's message with /unmute
-# Only group admins and owner can use this
 # ============================================
 @app.on_message(filters.command("unmute") & filters.group)
 async def admin_unmute(client, message):
@@ -679,7 +638,6 @@ async def admin_unmute(client, message):
     if chat_id not in ALLOWED_GROUPS:
         return
 
-    # Check if sender is admin or owner
     try:
         sender = await app.get_chat_member(chat_id, message.from_user.id)
         if sender.status not in [
@@ -690,7 +648,6 @@ async def admin_unmute(client, message):
     except Exception:
         return
 
-    # Must reply to a message to identify the user
     if not message.reply_to_message or not message.reply_to_message.from_user:
         await message.reply("↩️ Reply to the user's message and use /unmute")
         return
@@ -699,7 +656,6 @@ async def admin_unmute(client, message):
     user_id = target.id
     first_name = target.first_name or str(user_id)
 
-    # Remove from video_muted so poller won't block them again
     video_muted.get(chat_id, set()).discard(user_id)
 
     success = await unmute_in_vc(chat_id, user_id)
@@ -712,6 +668,7 @@ async def admin_unmute(client, message):
         )
     else:
         await message.reply(f"⚠️ Could not unmute **{first_name}** — they may not be in VC.")
+
 @app.on_message(filters.left_chat_member)
 async def handle_left_group_member(client, message):
     chat_id = message.chat.id
@@ -723,12 +680,10 @@ async def handle_left_group_member(client, message):
     remove_group_member(user_id, chat_id)
 
 # ============================================
-# 🖼️ BACKGROUND DP CHECK — runs after mute/unmute
-# so it never delays the join handling
+# 🖼️ BACKGROUND DP CHECK
 # ============================================
 async def _background_dp_check(chat_id, user_id, first_name):
     try:
-        # Skip if Sightengine not configured
         if SIGHTENGINE_USER == "YOUR_API_USER":
             return
 
@@ -787,8 +742,6 @@ async def handle_vc_join(chat_id, user_id):
                     "Group link in bio", warns=warns)
             return
 
-        # ── NSFW DP CHECK ──
-        # Runs in background — doesn't delay mute/unmute decision
         asyncio.create_task(_background_dp_check(chat_id, user_id, first_name))
 
         member_ok = await is_real_member(chat_id, user_id)
@@ -806,10 +759,7 @@ async def handle_vc_join(chat_id, user_id):
         print(f"❌ handle_vc_join error {user_id}: {e}")
 
 # ============================================
-# 📢 HANDLE CHANNEL JOINING VC — ban + VC kick
-# Step 1: ban_chat_member (works if channel is a group member)
-# Step 2: EditGroupCallParticipant removed=True (kicks from VC
-#         even if channel is NOT a group member)
+# 📢 HANDLE CHANNEL JOINING VC
 # ============================================
 async def handle_channel_vc_join(chat_id, channel_id):
     try:
@@ -824,7 +774,6 @@ async def handle_channel_vc_join(chat_id, channel_id):
 
         print(f"📢 Channel joined VC: {channel_name} ({channel_id})")
 
-        # ✅ Skip whitelisted channels (owner's own channels)
         if channel_id in ALLOWED_CHANNELS:
             print(f"⏭️ Channel {channel_name} is whitelisted — skipping!")
             return
@@ -832,7 +781,6 @@ async def handle_channel_vc_join(chat_id, channel_id):
         banned = False
         kicked = False
 
-        # ── STEP 1: Try banning from group ──
         try:
             await app.ban_chat_member(chat_id, peer_chat_id)
             banned = True
@@ -840,16 +788,14 @@ async def handle_channel_vc_join(chat_id, channel_id):
         except Exception as e:
             print(f"⚠️ Ban failed (not a group member?): {e}")
 
-        # ── STEP 2: Kick from VC call regardless ──
         try:
             call = await get_cached_call(chat_id)
             if call:
                 from pyrogram.raw.types import InputPeerChannel
                 channel_peer = InputPeerChannel(
                     channel_id=channel_id,
-                    access_hash=0  # Telegram accepts 0 for channels we don't have hash for
+                    access_hash=0
                 )
-                # Try resolving proper peer first for correct access_hash
                 try:
                     channel_peer = await app.resolve_peer(peer_chat_id)
                 except Exception:
@@ -863,7 +809,6 @@ async def handle_channel_vc_join(chat_id, channel_id):
                         volume=0,
                     )
                 )
-                # Small delay then remove
                 await asyncio.sleep(0.5)
                 await app.invoke(
                     EditGroupCallParticipant(
@@ -877,7 +822,6 @@ async def handle_channel_vc_join(chat_id, channel_id):
         except Exception as e:
             print(f"⚠️ VC kick error: {e}")
 
-        # ── LOG RESULT ──
         if banned and kicked:
             action = "🚫 Channel Banned + Kicked from VC"
             reason = "Channel account joined Voice Chat — banned from group and removed from VC"
@@ -897,8 +841,7 @@ async def handle_channel_vc_join(chat_id, channel_id):
         print(f"❌ handle_channel_vc_join error {channel_id}: {e}")
 
 # ============================================
-# 📷 HANDLE CAMERA / SCREENSHARE — mute instantly
-# Fires for ANY user (member or non-member)
+# 📷 HANDLE CAMERA / SCREENSHARE
 # ============================================
 async def handle_video_screenshare(chat_id, user_id):
     try:
@@ -914,7 +857,6 @@ async def handle_video_screenshare(chat_id, user_id):
         print(f"📷 {first_name} ({user_id}) turned on camera/screenshare — muting!")
         success = await mute_in_vc(chat_id, user_id)
         if success:
-            # Track separately so poll_muted_users never auto-unmutes them
             if chat_id not in video_muted:
                 video_muted[chat_id] = set()
             video_muted[chat_id].add(user_id)
@@ -945,7 +887,6 @@ async def poll_vc():
             for chat_id in ALLOWED_GROUPS:
                 current_ids, current_channels, current_video = await get_vc_participants(chat_id)
 
-                # --- USER JOINS ---
                 previous_ids = vc_members.get(chat_id, set())
                 new_joiners = current_ids - previous_ids
                 left_vc = previous_ids - current_ids
@@ -961,7 +902,6 @@ async def poll_vc():
 
                 vc_members[chat_id] = current_ids
 
-                # --- CHANNEL JOINS ---
                 previous_channels = vc_channels.get(chat_id, set())
                 new_channels = current_channels - previous_channels
 
@@ -971,9 +911,7 @@ async def poll_vc():
 
                 vc_channels[chat_id] = current_channels
 
-                # --- CAMERA / SCREENSHARE ---
                 previous_video = vc_video_users.get(chat_id, set())
-                # Only fire for users who JUST turned it on (not already flagged)
                 new_video = current_video - previous_video
 
                 for user_id in new_video:
@@ -988,10 +926,7 @@ async def poll_vc():
         await asyncio.sleep(2)
 
 # ============================================
-# 🔄 MUTED USER POLLER — checks every 3s if a
-# muted-but-not-yet-member has since joined the group
-# Fixes: on_chat_member_updated not firing for
-# RESTRICTED→MEMBER transitions in Pyrogram 2.x
+# 🔄 MUTED USER POLLER — checks every 3s
 # ============================================
 async def poll_muted_users():
     print("🔄 Muted-user poller started!")
@@ -1000,13 +935,10 @@ async def poll_muted_users():
             for chat_id in ALLOWED_GROUPS:
                 muted_set = muted_in_vc.get(chat_id, set()).copy()
                 for user_id in muted_set:
-                    # NEVER auto-unmute users muted for camera/screenshare — admin only
                     if user_id in video_muted.get(chat_id, set()):
                         continue
 
-                    # Skip users we already know are real members
                     if is_known_member(user_id, chat_id):
-                        # They're in DB → unmute and clear
                         try:
                             user_info = await app.get_users(user_id)
                             first_name = getattr(user_info, 'first_name', None) or str(user_id)
@@ -1022,7 +954,6 @@ async def poll_muted_users():
                             )
                         continue
 
-                    # Not in DB — do a live check
                     try:
                         member = await app.get_chat_member(chat_id, user_id)
                         status = member.status
@@ -1068,16 +999,11 @@ async def main():
     print(f"✅ Bot is running!")
     print(f"✅ Monitoring: {ALLOWED_GROUPS}")
 
-    # ✅ RAILWAY FIX — force-register all group peers into session cache
-    # Without this, resolve_peer(-100xxx) fails with "Peer id invalid"
-    # because a fresh/uploaded session has no peer info for groups it
-    # hasn't seen yet in THIS environment.
     print("🔄 Registering group peers...")
     for chat_id in ALLOWED_GROUPS:
         for attempt in range(5):
             try:
                 chat_info = await app.get_chat(chat_id)
-                # Also join the update feed for this chat
                 await app.invoke(
                     GetFullChannel(channel=await app.resolve_peer(chat_id))
                 )
@@ -1087,13 +1013,20 @@ async def main():
                 print(f"⚠️ Peer register attempt {attempt+1}/5 for {chat_id}: {e}")
                 await asyncio.sleep(2)
 
+    print("🔄 Registering log channel peer...")
+    for attempt in range(5):
+        try:
+            log_chat = await app.get_chat(LOG_CHANNEL)
+            print(f"✅ Log channel registered: {log_chat.title}")
+            break
+        except Exception as e:
+            print(f"⚠️ Log channel register attempt {attempt+1}/5: {e}")
+            await asyncio.sleep(2)
+
     try:
-        chat = await app.get_chat(LOG_CHANNEL)
-        print(f"✅ Log channel: {chat.title}")
-        await app.send_message(LOG_CHANNEL,
-            "✅ **VC Bot Started!** Now monitoring.")
+        await app.send_message(LOG_CHANNEL, "✅ **VC Bot Started!** Now monitoring.")
     except Exception as e:
-        print(f"⚠️ Log channel error: {e}")
+        print(f"⚠️ Startup message error: {e}")
 
     asyncio.create_task(poll_vc())
     asyncio.create_task(poll_muted_users())
