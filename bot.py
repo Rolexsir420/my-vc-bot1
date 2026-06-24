@@ -19,7 +19,7 @@ def now_ist():
 # --- FILL THESE ---
 API_ID = 38524810
 API_HASH = "af88419ea0782d5644f2dbe7e3561ae2"
-LOG_CHANNEL = "@imparthii"
+LOG_CHANNEL = -1003840632852
 OWNER_ID = 8834161906
 ALLOWED_GROUPS = [-1002483433187]
 ALLOWED_CHANNELS = []
@@ -205,14 +205,27 @@ def is_known_member(user_id, chat_id):
 # ============================================
 # 📋 LOG
 # ============================================
-async def send_log(action, user_name, user_id, chat_id, reason, warns=None):
+async def send_log(action, user_name, user_id, chat_id, reason, warns=None, is_channel=False):
+    """
+    is_channel=False (default): user_id is a real Telegram user ID,
+        so the name is rendered as a clickable tg://user?id= link.
+    is_channel=True: user_id is actually a channel ID (used when a
+        channel account joins VC). tg://user?id= does NOT work for
+        channels, so we just show plain text instead of a broken link.
+    """
     now = now_ist()
     warn_line = f"⚠️ **Warnings:** `{warns}/3`\n" if warns else ""
+
+    if is_channel:
+        user_line = f"👤 **User:** {user_name} (`{user_id}`)"
+    else:
+        user_line = f"👤 **User:** [{user_name}](tg://user?id={user_id}) (`{user_id}`)"
+
     text = (
         f"📋 **VC BOT LOG**\n"
         f"━━━━━━━━━━━━━━━━\n"
         f"🕐 **Time (IST):** `{now}`\n"
-        f"👤 **User:** {user_name} (`{user_id}`)\n"
+        f"{user_line}\n"
         f"👥 **Group:** `{chat_id}`\n"
         f"⚡ **Action:** {action}\n"
         f"📝 **Reason:** {reason}\n"
@@ -425,7 +438,7 @@ async def dp_review_callback(client, callback_query):
                     f"👮 Admin: {admin_name} (`{admin.id}`)\n"
                     f"🕐 Time: `{now_ist()}`"
                 )
-                fire_log(
+                await send_log(
                     "🚫 Banned (NSFW DP — Admin Action)",
                     first_name, user_id, chat_id,
                     f"Admin {admin_name} reviewed and banned for suspicious DP"
@@ -712,6 +725,7 @@ async def admin_unmute(client, message):
         )
     else:
         await message.reply(f"⚠️ Could not unmute **{first_name}** — they may not be in VC.")
+
 @app.on_message(filters.left_chat_member)
 async def handle_left_group_member(client, message):
     chat_id = message.chat.id
@@ -891,7 +905,9 @@ async def handle_channel_vc_join(chat_id, channel_id):
             action = "⚠️ Channel Detected in VC (action failed)"
             reason = "Channel account joined Voice Chat — both ban and kick failed"
 
-        await send_log(action, f"📢 {channel_name}", channel_id, chat_id, reason)
+        # NOTE: is_channel=True here — channel_id is NOT a user id,
+        # so we don't (and can't) make it a tg://user?id= link.
+        await send_log(action, f"📢 {channel_name}", channel_id, chat_id, reason, is_channel=True)
 
     except Exception as e:
         print(f"❌ handle_channel_vc_join error {channel_id}: {e}")
