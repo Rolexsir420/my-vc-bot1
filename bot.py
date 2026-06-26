@@ -993,8 +993,13 @@ async def _execute_mass_kick_demotion(chat_id, actor_id, actor_name, count, sour
     except Exception as e:
         print(f"❌ Owner DM failed: {e}")
 
-    await send_log("🛡️ Auto-Demoted (Mass Kick)", actor_name, actor_id, chat_id,
-        f"Kicked {count} members in {KICK_WINDOW}s — admin privileges removed")
+    if demoted:
+        await send_log("🛡️ Auto-Demoted (Mass Kick)", actor_name, actor_id, chat_id,
+            f"Kicked {count} members in {KICK_WINDOW}s — admin privileges removed")
+    else:
+        await send_log("⚠️ Mass-Kick Detected — Demote FAILED", actor_name, actor_id, chat_id,
+            f"Kicked {count} members in {KICK_WINDOW}s — bot lacks 'Add New Admins' permission, "
+            f"demote manually and grant that permission to fix this automatically next time")
 
 
 async def poll_admin_kick_log():
