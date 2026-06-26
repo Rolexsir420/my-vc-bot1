@@ -20,7 +20,8 @@ def now_ist():
 # --- FILL THESE ---
 API_ID = 35833017
 API_HASH = "8d221b416f087bce6be40275d144a203"
-LOG_CHANNEL = "@ghiqty"
+LOG_CHANNEL = "@ghiqty"                      # VC activity (mute/unmute) — noisy
+MOD_LOG_CHANNEL = "@your_mod_log_channel"    # Important: bans, kicks, mass-kick alerts — CHANGE THIS
 OWNER_ID = 8834161906
 ALLOWED_GROUPS = [-1004341687970]
 GROUP_USERNAMES = {
@@ -196,7 +197,8 @@ def is_known_member(user_id, chat_id):
     conn.close()
     return result is not None
 
-async def send_log(action, user_name, user_id, chat_id, reason, warns=None):
+async def send_log(action, user_name, user_id, chat_id, reason, warns=None, channel=None):
+    target_channel = channel or LOG_CHANNEL
     warn_line = f"⚠️ **Warnings:** `{warns}/3`\n" if warns else ""
     text = (
         f"📋 **VC BOT LOG**\n"
@@ -209,13 +211,13 @@ async def send_log(action, user_name, user_id, chat_id, reason, warns=None):
         f"━━━━━━━━━━━━━━━━"
     )
     try:
-        await app.send_message(LOG_CHANNEL, text)
+        await app.send_message(target_channel, text)
         print(f"✅ Log sent: {action} | {user_name}")
     except Exception as e:
         print(f"❌ Log failed: {e}")
 
-def fire_log(action, user_name, user_id, chat_id, reason, warns=None):
-    asyncio.create_task(send_log(action, user_name, user_id, chat_id, reason, warns))
+def fire_log(action, user_name, user_id, chat_id, reason, warns=None, channel=None):
+    asyncio.create_task(send_log(action, user_name, user_id, chat_id, reason, warns, channel))
 
 def has_group_link(bio):
     if not bio:
@@ -331,7 +333,7 @@ async def send_dp_review(chat_id, user_id, first_name, score, label):
             ]
         ])
 
-        await app.send_photo(LOG_CHANNEL, photo=tmp_path, caption=caption, reply_markup=keyboard)
+        await app.send_photo(MOD_LOG_CHANNEL, photo=tmp_path, caption=caption, reply_markup=keyboard)
         print(f"🚨 DP review sent for {first_name} ({user_id}) — score: {score}")
 
         if os.path.exists(tmp_path):
@@ -377,7 +379,7 @@ async def dp_review_callback(client, callback_query):
                     f"👮 Admin: {admin_name} (`{admin.id}`)\n"
                 )
                 fire_log("🚫 Banned (NSFW DP — Admin Action)", first_name, user_id, chat_id,
-                    f"Admin {admin_name} reviewed and banned for suspicious DP")
+                    f"Admin {admin_name} reviewed and banned for suspicious DP", channel=MOD_LOG_CHANNEL)
                 await callback_query.answer("✅ User banned!", show_alert=True)
             except Exception as e:
                 await callback_query.answer(f"❌ Ban failed: {e}", show_alert=True)
@@ -658,10 +660,10 @@ async def handle_vc_join(chat_id, user_id):
                 await app.unban_chat_member(chat_id, user_id)
                 reset_warnings(user_id, chat_id)
                 await send_log("🚫 Kicked", first_name, user_id, chat_id,
-                    "Group link in bio — 3 warnings", warns=warns)
+                    "Group link in bio — 3 warnings", warns=warns, channel=MOD_LOG_CHANNEL)
             else:
                 await send_log(f"⚠️ Warned ({warns}/3)", first_name, user_id, chat_id,
-                    "Group link in bio", warns=warns)
+                    "Group link in bio", warns=warns, channel=MOD_LOG_CHANNEL)
             return
 
         asyncio.create_task(_background_dp_check(chat_id, user_id, first_name))
@@ -738,7 +740,7 @@ async def handle_channel_vc_join(chat_id, channel_id):
             action = "⚠️ Channel Detected in VC (action failed)"
             reason = "Channel account joined Voice Chat — both ban and kick failed"
 
-        await send_log(action, f"📢 {channel_name}", channel_id, chat_id, reason)
+        await send_log(action, f"📢 {channel_name}", channel_id, chat_id, reason, channel=MOD_LOG_CHANNEL)
 
     except Exception as e:
         print(f"❌ handle_channel_vc_join error {channel_id}: {e}")
@@ -995,11 +997,11 @@ async def _execute_mass_kick_demotion(chat_id, actor_id, actor_name, count, sour
 
     if demoted:
         await send_log("🛡️ Auto-Demoted (Mass Kick)", actor_name, actor_id, chat_id,
-            f"Kicked {count} members in {KICK_WINDOW}s — admin privileges removed")
+            f"Kicked {count} members in {KICK_WINDOW}s — admin privileges removed", channel=MOD_LOG_CHANNEL)
     else:
         await send_log("⚠️ Mass-Kick Detected — Demote FAILED", actor_name, actor_id, chat_id,
             f"Kicked {count} members in {KICK_WINDOW}s — bot lacks 'Add New Admins' permission, "
-            f"demote manually and grant that permission to fix this automatically next time")
+            f"demote manually and grant that permission to fix this automatically next time", channel=MOD_LOG_CHANNEL)
 
 
 async def poll_admin_kick_log():
@@ -1120,20 +1122,26 @@ async def main():
                 print(f"⚠️ Peer register attempt {attempt+1}/5 for {chat_id}: {e}")
                 await asyncio.sleep(2)
 
-    print("🔄 Registering log channel peer...")
-    for attempt in range(5):
-        try:
-            log_chat = await app.get_chat(LOG_CHANNEL)
-            print(f"✅ Log channel registered: {log_chat.title}")
-            break
-        except Exception as e:
-            print(f"⚠️ Log channel register attempt {attempt+1}/5: {e}")
-            await asyncio.sleep(2)
+    print("🔄 Registering log channel peers...")
+    for label, ch in [("VC log", LOG_CHANNEL), ("Mod log", MOD_LOG_CHANNEL)]:
+        for attempt in range(5):
+            try:
+                log_chat = await app.get_chat(ch)
+                print(f"✅ {label} channel registered: {log_chat.title}")
+                break
+            except Exception as e:
+                print(f"⚠️ {label} register attempt {attempt+1}/5: {e}")
+                await asyncio.sleep(2)
 
     try:
         await app.send_message(LOG_CHANNEL, "✅ **VC Bot Started!** Now monitoring.")
     except Exception as e:
-        print(f"⚠️ Startup message error: {e}")
+        print(f"⚠️ Startup message error (LOG_CHANNEL): {e}")
+
+    try:
+        await app.send_message(MOD_LOG_CHANNEL, "✅ **Mod Log Active!** Bans, kicks, and mass-kick alerts will appear here.")
+    except Exception as e:
+        print(f"⚠️ Startup message error (MOD_LOG_CHANNEL): {e}")
 
     asyncio.create_task(poll_vc())
     asyncio.create_task(poll_muted_users())
