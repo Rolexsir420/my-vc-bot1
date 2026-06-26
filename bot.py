@@ -21,7 +21,7 @@ API_ID = 38524810
 API_HASH = "af88419ea0782d5644f2dbe7e3561ae2"
 LOG_CHANNEL = "@ghiqty"
 OWNER_ID = 8834161906
-ALLOWED_GROUPS = [-1002483433187]
+ALLOWED_GROUPS = [-1004341687970]
 ALLOWED_CHANNELS = []
 
 # --- SIGHTENGINE (free tier: sightengine.com) ---
@@ -45,6 +45,14 @@ muted_in_vc = {}
 vc_channels = {}
 vc_video_users = {}
 video_muted = {}
+
+# ============================================
+# 🛡️ ANTI-MASS-KICK TRACKING
+# ============================================
+# {chat_id: {admin_id: [timestamp, timestamp, ...]}}
+kick_tracker = {}
+KICK_THRESHOLD = 10      # kicks
+KICK_WINDOW    = 60      # seconds
 
 # ============================================
 # 🛡️ PYROGRAM BUG FIX
@@ -988,6 +996,117 @@ async def poll_muted_users():
             print(f"❌ Muted poller error: {e}")
 
         await asyncio.sleep(3)
+
+# ============================================
+# 🛡️ ANTI-MASS-KICK — auto demote on mass removal
+# ============================================
+@app.on_chat_member_updated()
+async def anti_mass_kick_monitor(client, update):
+    try:
+        chat_id = update.chat.id
+        if chat_id not in ALLOWED_GROUPS:
+            return
+
+        # Only care about members being kicked/banned
+        old = update.old_chat_member
+        new = update.new_chat_member
+        if not old or not new:
+            return
+
+        old_status = old.status
+        new_status = new.status
+
+        kicked = (
+            new_status == enums.ChatMemberStatus.BANNED or
+            (old_status == enums.ChatMemberStatus.MEMBER and
+             new_status == enums.ChatMemberStatus.LEFT)
+        )
+        if not kicked:
+            return
+
+        # Who did the kick?
+        if not update.old_chat_member or not hasattr(update, 'from_user') or not update.from_user:
+            return
+
+        actor = update.from_user
+        actor_id = actor.id
+
+        # Never track owner
+        if actor_id == OWNER_ID:
+            return
+
+        # Only track if actor is an admin
+        try:
+            actor_member = await app.get_chat_member(chat_id, actor_id)
+            if actor_member.status not in [
+                enums.ChatMemberStatus.ADMINISTRATOR,
+                enums.ChatMemberStatus.OWNER
+            ]:
+                return
+        except Exception:
+            return
+
+        # Record kick timestamp
+        now = asyncio.get_event_loop().time()
+        if chat_id not in kick_tracker:
+            kick_tracker[chat_id] = {}
+        if actor_id not in kick_tracker[chat_id]:
+            kick_tracker[chat_id][actor_id] = []
+
+        # Prune old timestamps outside window
+        kick_tracker[chat_id][actor_id] = [
+            t for t in kick_tracker[chat_id][actor_id]
+            if now - t < KICK_WINDOW
+        ]
+        kick_tracker[chat_id][actor_id].append(now)
+
+        count = len(kick_tracker[chat_id][actor_id])
+        print(f"⚠️ Admin {actor_id} kick count: {count}/{KICK_THRESHOLD} in last {KICK_WINDOW}s")
+
+        if count >= KICK_THRESHOLD:
+            # Reset tracker immediately to avoid repeat triggers
+            kick_tracker[chat_id][actor_id] = []
+
+            actor_name = getattr(actor, 'first_name', None) or str(actor_id)
+
+            # Demote: promote with zero rights = demote
+            try:
+                await app.promote_chat_member(
+                    chat_id,
+                    actor_id,
+                    privileges=None  # strips all admin rights
+                )
+                demoted = True
+                print(f"🛡️ Auto-demoted admin {actor_name} ({actor_id}) for mass-kick!")
+            except Exception as e:
+                demoted = False
+                print(f"❌ Demote failed for {actor_id}: {e}")
+
+            # DM owner
+            dm_text = (
+                f"🚨 **Anti-Mass-Kick Alert**\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"👤 **Admin:** [{actor_name}](tg://user?id={actor_id}) (`{actor_id}`)\n"
+                f"👥 **Group:** `{chat_id}`\n"
+                f"⚡ **Kicks:** `{count}` in `{KICK_WINDOW}` seconds\n"
+                f"🛡️ **Action:** {'✅ Auto-demoted' if demoted else '❌ Demote failed — please demote manually!'}\n"
+                f"━━━━━━━━━━━━━━━━"
+            )
+            try:
+                await app.send_message(OWNER_ID, dm_text)
+            except Exception as e:
+                print(f"❌ Owner DM failed: {e}")
+
+            # Also log to log channel
+            await send_log(
+                "🛡️ Auto-Demoted (Mass Kick)",
+                actor_name, actor_id, chat_id,
+                f"Kicked {count} members in {KICK_WINDOW}s — admin privileges removed"
+            )
+
+    except Exception as e:
+        print(f"❌ anti_mass_kick_monitor error: {e}")
+
 
 # ============================================
 # 🚀 MAIN
