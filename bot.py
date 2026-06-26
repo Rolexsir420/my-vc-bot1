@@ -1,7 +1,7 @@
 from pyrogram import Client, enums, filters
 from pyrogram.raw.functions.phone import GetGroupCall, EditGroupCallParticipant
 from pyrogram.raw.functions.channels import GetFullChannel
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ChatPrivileges
 from datetime import datetime
 import sqlite3
 import re
@@ -888,10 +888,9 @@ async def anti_mass_kick_monitor(client, update):
         if not kicked:
             return
 
-        if not update.old_chat_member or not hasattr(update, 'from_user') or not update.from_user:
+        actor = getattr(update, 'from_user', None)
+        if not actor:
             return
-
-        actor = update.from_user
         actor_id = actor.id
 
         if actor_id == OWNER_ID:
@@ -927,7 +926,20 @@ async def anti_mass_kick_monitor(client, update):
             actor_name = getattr(actor, 'first_name', None) or str(actor_id)
 
             try:
-                await app.promote_chat_member(chat_id, actor_id, privileges=None)
+                await app.promote_chat_member(
+                    chat_id,
+                    actor_id,
+                    privileges=ChatPrivileges(
+                        can_manage_chat=False,
+                        can_delete_messages=False,
+                        can_manage_video_chats=False,
+                        can_restrict_members=False,
+                        can_promote_members=False,
+                        can_change_info=False,
+                        can_invite_users=False,
+                        can_pin_messages=False,
+                    )
+                )
                 demoted = True
                 print(f"🛡️ Auto-demoted admin {actor_name} ({actor_id}) for mass-kick!")
             except Exception as e:
