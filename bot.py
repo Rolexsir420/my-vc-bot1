@@ -16,15 +16,16 @@ IST = pytz.timezone('Asia/Kolkata')
 def now_ist():
     return datetime.now(IST).strftime("%I:%M:%S %p")
 
-# --- FILL THESE ---
 API_ID = 38524810
 API_HASH = "af88419ea0782d5644f2dbe7e3561ae2"
 LOG_CHANNEL = "@ghiqty"
 OWNER_ID = 8834161906
 ALLOWED_GROUPS = [-1004341687970]
+GROUP_USERNAMES = {
+    -1004341687970: "demoatbottttuh"
+}
 ALLOWED_CHANNELS = []
 
-# --- SIGHTENGINE (free tier: sightengine.com) ---
 SIGHTENGINE_USER   = "1297817509"
 SIGHTENGINE_SECRET = "DfGeVrNhJQJvBBTehCXkmmgPfru47mhv"
 NSFW_THRESHOLD = 0.6
@@ -46,17 +47,10 @@ vc_channels = {}
 vc_video_users = {}
 video_muted = {}
 
-# ============================================
-# 🛡️ ANTI-MASS-KICK TRACKING
-# ============================================
-# {chat_id: {admin_id: [timestamp, timestamp, ...]}}
 kick_tracker = {}
-KICK_THRESHOLD = 10      # kicks
-KICK_WINDOW    = 60      # seconds
+KICK_THRESHOLD = 10
+KICK_WINDOW    = 60
 
-# ============================================
-# 🛡️ PYROGRAM BUG FIX
-# ============================================
 import pyrogram.client as _pyro_client
 _orig_handle_updates = _pyro_client.Client.handle_updates
 
@@ -71,9 +65,6 @@ async def _patched_handle_updates(self, updates):
 
 _pyro_client.Client.handle_updates = _patched_handle_updates
 
-# ============================================
-# 🚀 CALL CACHE
-# ============================================
 call_cache = {}
 call_cache_time = {}
 CACHE_TTL = 30
@@ -88,7 +79,11 @@ async def get_cached_call(chat_id):
     except (KeyError, ValueError) as e:
         print(f"⚠️ resolve_peer failed for {chat_id}, re-registering: {e}")
         try:
-            await app.get_chat(chat_id)
+            username = GROUP_USERNAMES.get(chat_id)
+            if username:
+                await app.get_chat(username)
+            else:
+                await app.get_chat(chat_id)
             peer = await app.resolve_peer(chat_id)
         except Exception as e2:
             print(f"❌ Re-register failed: {e2}")
@@ -108,9 +103,6 @@ def invalidate_call_cache(chat_id):
     call_cache.pop(chat_id, None)
     call_cache_time.pop(chat_id, None)
 
-# ============================================
-# 💾 DATABASE
-# ============================================
 def init_db():
     conn = sqlite3.connect("warnings.db")
     c = conn.cursor()
@@ -195,9 +187,6 @@ def is_known_member(user_id, chat_id):
     conn.close()
     return result is not None
 
-# ============================================
-# 📋 LOG — clickable name, no IST time
-# ============================================
 async def send_log(action, user_name, user_id, chat_id, reason, warns=None):
     warn_line = f"⚠️ **Warnings:** `{warns}/3`\n" if warns else ""
     text = (
@@ -219,9 +208,6 @@ async def send_log(action, user_name, user_id, chat_id, reason, warns=None):
 def fire_log(action, user_name, user_id, chat_id, reason, warns=None):
     asyncio.create_task(send_log(action, user_name, user_id, chat_id, reason, warns))
 
-# ============================================
-# 🔍 BIO CHECK
-# ============================================
 def has_group_link(bio):
     if not bio:
         return False
@@ -229,9 +215,6 @@ def has_group_link(bio):
         r"(t\.me/joinchat|t\.me/\+)[a-zA-Z0-9_-]+", bio
     ))
 
-# ============================================
-# 🖼️ NSFW DP CHECK — Sightengine API
-# ============================================
 async def check_dp_nsfw(user_id):
     tmp_path = None
     try:
@@ -290,7 +273,6 @@ async def check_dp_nsfw(user_id):
 
         max_label = max(scores, key=scores.get)
         max_score = scores[max_label]
-
         is_suspicious = max_score >= NSFW_THRESHOLD
         return is_suspicious, round(max_score, 2), max_label
 
@@ -303,7 +285,6 @@ async def check_dp_nsfw(user_id):
                 os.remove(tmp_path)
             except Exception:
                 pass
-
 
 async def send_dp_review(chat_id, user_id, first_name, score, label):
     try:
@@ -336,23 +317,12 @@ async def send_dp_review(chat_id, user_id, first_name, score, label):
 
         keyboard = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton(
-                    "🚫 Ban from Group",
-                    callback_data=f"dpban_{chat_id}_{user_id}"
-                ),
-                InlineKeyboardButton(
-                    "✅ Clear (Not NSFW)",
-                    callback_data=f"dpclear_{chat_id}_{user_id}"
-                ),
+                InlineKeyboardButton("🚫 Ban from Group", callback_data=f"dpban_{chat_id}_{user_id}"),
+                InlineKeyboardButton("✅ Clear (Not NSFW)", callback_data=f"dpclear_{chat_id}_{user_id}"),
             ]
         ])
 
-        await app.send_photo(
-            LOG_CHANNEL,
-            photo=tmp_path,
-            caption=caption,
-            reply_markup=keyboard
-        )
+        await app.send_photo(LOG_CHANNEL, photo=tmp_path, caption=caption, reply_markup=keyboard)
         print(f"🚨 DP review sent for {first_name} ({user_id}) — score: {score}")
 
         if os.path.exists(tmp_path):
@@ -361,10 +331,6 @@ async def send_dp_review(chat_id, user_id, first_name, score, label):
     except Exception as e:
         print(f"❌ send_dp_review error: {e}")
 
-
-# ============================================
-# 🔘 CALLBACK: Admin taps Ban / Clear on DP review
-# ============================================
 @app.on_callback_query(filters.regex(r"^dp(ban|clear)_(-?\d+)_(\d+)$"))
 async def dp_review_callback(client, callback_query):
     try:
@@ -401,11 +367,8 @@ async def dp_review_callback(client, callback_query):
                     f"👤 User: [{first_name}](tg://user?id={user_id}) (`{user_id}`)\n"
                     f"👮 Admin: {admin_name} (`{admin.id}`)\n"
                 )
-                fire_log(
-                    "🚫 Banned (NSFW DP — Admin Action)",
-                    first_name, user_id, chat_id,
-                    f"Admin {admin_name} reviewed and banned for suspicious DP"
-                )
+                fire_log("🚫 Banned (NSFW DP — Admin Action)", first_name, user_id, chat_id,
+                    f"Admin {admin_name} reviewed and banned for suspicious DP")
                 await callback_query.answer("✅ User banned!", show_alert=True)
             except Exception as e:
                 await callback_query.answer(f"❌ Ban failed: {e}", show_alert=True)
@@ -428,18 +391,12 @@ async def dp_review_callback(client, callback_query):
         print(f"❌ dp_review_callback error: {e}")
         await callback_query.answer("❌ Error processing action.", show_alert=True)
 
-
-# ============================================
-# 🎙️ GET VC PARTICIPANTS
-# ============================================
 async def get_vc_participants(chat_id):
     try:
         call = await get_cached_call(chat_id)
         if not call:
             return set(), set(), set()
-        result = await app.invoke(
-            GetGroupCall(call=call, limit=500)
-        )
+        result = await app.invoke(GetGroupCall(call=call, limit=500))
         user_ids = set()
         channel_ids = set()
         video_users = set()
@@ -459,9 +416,6 @@ async def get_vc_participants(chat_id):
         print(f"❌ Get VC error: {e}")
         return set(), set(), set()
 
-# ============================================
-# 🔇 MUTE IN VC
-# ============================================
 async def mute_in_vc(chat_id, user_id):
     for attempt in range(3):
         try:
@@ -469,13 +423,7 @@ async def mute_in_vc(chat_id, user_id):
             if not call:
                 return False
             user_peer = await app.resolve_peer(user_id)
-            await app.invoke(
-                EditGroupCallParticipant(
-                    call=call,
-                    participant=user_peer,
-                    muted=True
-                )
-            )
+            await app.invoke(EditGroupCallParticipant(call=call, participant=user_peer, muted=True))
             print(f"🔇 Muted: {user_id}")
             if chat_id not in muted_in_vc:
                 muted_in_vc[chat_id] = set()
@@ -490,9 +438,6 @@ async def mute_in_vc(chat_id, user_id):
                 return False
     return False
 
-# ============================================
-# 🔊 UNMUTE IN VC
-# ============================================
 async def unmute_in_vc(chat_id, user_id):
     for attempt in range(3):
         try:
@@ -500,13 +445,7 @@ async def unmute_in_vc(chat_id, user_id):
             if not call:
                 return False
             user_peer = await app.resolve_peer(user_id)
-            await app.invoke(
-                EditGroupCallParticipant(
-                    call=call,
-                    participant=user_peer,
-                    muted=False
-                )
-            )
+            await app.invoke(EditGroupCallParticipant(call=call, participant=user_peer, muted=False))
             print(f"🔊 Unmuted: {user_id}")
             if chat_id in muted_in_vc:
                 muted_in_vc[chat_id].discard(user_id)
@@ -520,9 +459,6 @@ async def unmute_in_vc(chat_id, user_id):
                 return False
     return False
 
-# ============================================
-# ✅ CHECK IF USER IS REAL MEMBER
-# ============================================
 async def is_real_member(chat_id, user_id):
     try:
         member = await app.get_chat_member(chat_id, user_id)
@@ -555,9 +491,6 @@ async def is_real_member(chat_id, user_id):
         print(f"❌ Status check error: {e}")
         return is_known_member(user_id, chat_id)
 
-# ============================================
-# ⚡ INSTANT UNMUTE
-# ============================================
 async def instant_unmute_if_in_vc(chat_id, user_id, first_name, source):
     print(f"⚡ [{source}] {first_name} ({user_id}) joined group!")
     save_group_member(user_id, chat_id)
@@ -572,17 +505,11 @@ async def instant_unmute_if_in_vc(chat_id, user_id, first_name, source):
         print(f"🔊 {first_name} in VC — unmuting instantly!")
         success = await unmute_in_vc(chat_id, user_id)
         if success:
-            await send_log(
-                f"🔊 Auto Unmuted ({source})",
-                first_name, user_id, chat_id,
-                "Joined group while sitting in VC"
-            )
+            await send_log(f"🔊 Auto Unmuted ({source})", first_name, user_id, chat_id,
+                "Joined group while sitting in VC")
     else:
         print(f"ℹ️ {first_name} not in VC")
 
-# ============================================
-# 🔄 HANDLER 1: on_chat_member_updated
-# ============================================
 @app.on_chat_member_updated()
 async def on_member_update(client, update):
     try:
@@ -609,16 +536,11 @@ async def on_member_update(client, update):
         if user_id == OWNER_ID:
             return
 
-        await instant_unmute_if_in_vc(
-            chat_id, user_id, first_name, "Event"
-        )
+        await instant_unmute_if_in_vc(chat_id, user_id, first_name, "Event")
 
     except Exception as e:
         print(f"❌ Member update error: {e}")
 
-# ============================================
-# 🔄 HANDLER 2: new_chat_members message
-# ============================================
 @app.on_message(filters.new_chat_members)
 async def handle_new_group_member(client, message):
     chat_id = message.chat.id
@@ -633,13 +555,8 @@ async def handle_new_group_member(client, message):
             continue
 
         print(f"👥 [MSG] {first_name} joined group")
-        await instant_unmute_if_in_vc(
-            chat_id, user_id, first_name, "Message"
-        )
+        await instant_unmute_if_in_vc(chat_id, user_id, first_name, "Message")
 
-# ============================================
-# 🔊 ADMIN UNMUTE COMMAND
-# ============================================
 @app.on_message(filters.command("unmute") & filters.group)
 async def admin_unmute(client, message):
     chat_id = message.chat.id
@@ -669,11 +586,8 @@ async def admin_unmute(client, message):
     success = await unmute_in_vc(chat_id, user_id)
     if success:
         await message.reply(f"🔊 **{first_name}** has been unmuted by admin.")
-        await send_log(
-            "🔊 Admin Unmuted",
-            first_name, user_id, chat_id,
-            f"Manually unmuted by {message.from_user.first_name} ({message.from_user.id})"
-        )
+        await send_log("🔊 Admin Unmuted", first_name, user_id, chat_id,
+            f"Manually unmuted by {message.from_user.first_name} ({message.from_user.id})")
     else:
         await message.reply(f"⚠️ Could not unmute **{first_name}** — they may not be in VC.")
 
@@ -687,14 +601,10 @@ async def handle_left_group_member(client, message):
     print(f"👋 Left group: {first_name} ({user_id})")
     remove_group_member(user_id, chat_id)
 
-# ============================================
-# 🖼️ BACKGROUND DP CHECK
-# ============================================
 async def _background_dp_check(chat_id, user_id, first_name):
     try:
         if SIGHTENGINE_USER == "YOUR_API_USER":
             return
-
         is_suspicious, score, label = await check_dp_nsfw(user_id)
         if is_suspicious:
             print(f"🚨 Suspicious DP: {first_name} ({user_id}) score={score} label={label}")
@@ -704,9 +614,6 @@ async def _background_dp_check(chat_id, user_id, first_name):
     except Exception as e:
         print(f"❌ _background_dp_check error {user_id}: {e}")
 
-# ============================================
-# 🤖 HANDLE VC JOIN
-# ============================================
 async def handle_vc_join(chat_id, user_id):
     try:
         if user_id == OWNER_ID:
@@ -741,12 +648,10 @@ async def handle_vc_join(chat_id, user_id):
                 await app.ban_chat_member(chat_id, user_id)
                 await app.unban_chat_member(chat_id, user_id)
                 reset_warnings(user_id, chat_id)
-                await send_log("🚫 Kicked", first_name, user_id,
-                    chat_id, "Group link in bio — 3 warnings",
-                    warns=warns)
+                await send_log("🚫 Kicked", first_name, user_id, chat_id,
+                    "Group link in bio — 3 warnings", warns=warns)
             else:
-                await send_log(f"⚠️ Warned ({warns}/3)",
-                    first_name, user_id, chat_id,
+                await send_log(f"⚠️ Warned ({warns}/3)", first_name, user_id, chat_id,
                     "Group link in bio", warns=warns)
             return
 
@@ -760,15 +665,12 @@ async def handle_vc_join(chat_id, user_id):
         else:
             print(f"🔇 Not a member — muting: {first_name}")
             await mute_in_vc(chat_id, user_id)
-            await send_log("🔇 VC Muted", first_name, user_id,
-                chat_id, "User is not a group member")
+            await send_log("🔇 VC Muted", first_name, user_id, chat_id,
+                "User is not a group member")
 
     except Exception as e:
         print(f"❌ handle_vc_join error {user_id}: {e}")
 
-# ============================================
-# 📢 HANDLE CHANNEL JOINING VC
-# ============================================
 async def handle_channel_vc_join(chat_id, channel_id):
     try:
         peer_chat_id = int(f"-100{channel_id}")
@@ -794,37 +696,21 @@ async def handle_channel_vc_join(chat_id, channel_id):
             banned = True
             print(f"🚫 Banned channel from group: {channel_name}")
         except Exception as e:
-            print(f"⚠️ Ban failed (not a group member?): {e}")
+            print(f"⚠️ Ban failed: {e}")
 
         try:
             call = await get_cached_call(chat_id)
             if call:
                 from pyrogram.raw.types import InputPeerChannel
-                channel_peer = InputPeerChannel(
-                    channel_id=channel_id,
-                    access_hash=0
-                )
+                channel_peer = InputPeerChannel(channel_id=channel_id, access_hash=0)
                 try:
                     channel_peer = await app.resolve_peer(peer_chat_id)
                 except Exception:
                     pass
 
-                await app.invoke(
-                    EditGroupCallParticipant(
-                        call=call,
-                        participant=channel_peer,
-                        muted=True,
-                        volume=0,
-                    )
-                )
+                await app.invoke(EditGroupCallParticipant(call=call, participant=channel_peer, muted=True, volume=0))
                 await asyncio.sleep(0.5)
-                await app.invoke(
-                    EditGroupCallParticipant(
-                        call=call,
-                        participant=channel_peer,
-                        muted=True,
-                    )
-                )
+                await app.invoke(EditGroupCallParticipant(call=call, participant=channel_peer, muted=True))
                 kicked = True
                 print(f"👢 Kicked channel from VC: {channel_name}")
         except Exception as e:
@@ -848,9 +734,6 @@ async def handle_channel_vc_join(chat_id, channel_id):
     except Exception as e:
         print(f"❌ handle_channel_vc_join error {channel_id}: {e}")
 
-# ============================================
-# 📷 HANDLE CAMERA / SCREENSHARE
-# ============================================
 async def handle_video_screenshare(chat_id, user_id):
     try:
         if user_id == OWNER_ID:
@@ -868,18 +751,12 @@ async def handle_video_screenshare(chat_id, user_id):
             if chat_id not in video_muted:
                 video_muted[chat_id] = set()
             video_muted[chat_id].add(user_id)
-            await send_log(
-                "🔇 Muted (Camera/Screenshare)",
-                first_name, user_id, chat_id,
-                "User turned on camera or screen share in VC — only admin can unmute"
-            )
+            await send_log("🔇 Muted (Camera/Screenshare)", first_name, user_id, chat_id,
+                "User turned on camera or screen share in VC — only admin can unmute")
 
     except Exception as e:
         print(f"❌ handle_video_screenshare error {user_id}: {e}")
 
-# ============================================
-# 🎙️ VC POLLING — 2 seconds
-# ============================================
 async def poll_vc():
     print("🎙️ VC Polling started!")
     for chat_id in ALLOWED_GROUPS:
@@ -933,9 +810,6 @@ async def poll_vc():
 
         await asyncio.sleep(2)
 
-# ============================================
-# 🔄 MUTED USER POLLER — checks every 3s
-# ============================================
 async def poll_muted_users():
     print("🔄 Muted-user poller started!")
     while True:
@@ -955,11 +829,8 @@ async def poll_muted_users():
                         print(f"🔄 [POLL] {first_name} ({user_id}) is now a member — unmuting!")
                         success = await unmute_in_vc(chat_id, user_id)
                         if success:
-                            await send_log(
-                                "🔊 Auto Unmuted (Poll)",
-                                first_name, user_id, chat_id,
-                                "Joined group while sitting in VC (detected by poller)"
-                            )
+                            await send_log("🔊 Auto Unmuted (Poll)", first_name, user_id, chat_id,
+                                "Joined group while sitting in VC (detected by poller)")
                         continue
 
                     try:
@@ -983,11 +854,8 @@ async def poll_muted_users():
                             save_group_member(user_id, chat_id)
                             success = await unmute_in_vc(chat_id, user_id)
                             if success:
-                                await send_log(
-                                    "🔊 Auto Unmuted (Poll)",
-                                    first_name, user_id, chat_id,
-                                    "Joined group while sitting in VC (detected by poller)"
-                                )
+                                await send_log("🔊 Auto Unmuted (Poll)", first_name, user_id, chat_id,
+                                    "Joined group while sitting in VC (detected by poller)")
                     except Exception as e:
                         if "USER_NOT_PARTICIPANT" not in str(e):
                             print(f"❌ Muted poller check error for {user_id}: {e}")
@@ -997,9 +865,6 @@ async def poll_muted_users():
 
         await asyncio.sleep(3)
 
-# ============================================
-# 🛡️ ANTI-MASS-KICK — auto demote on mass removal
-# ============================================
 @app.on_chat_member_updated()
 async def anti_mass_kick_monitor(client, update):
     try:
@@ -1007,7 +872,6 @@ async def anti_mass_kick_monitor(client, update):
         if chat_id not in ALLOWED_GROUPS:
             return
 
-        # Only care about members being kicked/banned
         old = update.old_chat_member
         new = update.new_chat_member
         if not old or not new:
@@ -1024,18 +888,15 @@ async def anti_mass_kick_monitor(client, update):
         if not kicked:
             return
 
-        # Who did the kick?
         if not update.old_chat_member or not hasattr(update, 'from_user') or not update.from_user:
             return
 
         actor = update.from_user
         actor_id = actor.id
 
-        # Never track owner
         if actor_id == OWNER_ID:
             return
 
-        # Only track if actor is an admin
         try:
             actor_member = await app.get_chat_member(chat_id, actor_id)
             if actor_member.status not in [
@@ -1046,14 +907,12 @@ async def anti_mass_kick_monitor(client, update):
         except Exception:
             return
 
-        # Record kick timestamp
         now = asyncio.get_event_loop().time()
         if chat_id not in kick_tracker:
             kick_tracker[chat_id] = {}
         if actor_id not in kick_tracker[chat_id]:
             kick_tracker[chat_id][actor_id] = []
 
-        # Prune old timestamps outside window
         kick_tracker[chat_id][actor_id] = [
             t for t in kick_tracker[chat_id][actor_id]
             if now - t < KICK_WINDOW
@@ -1064,25 +923,17 @@ async def anti_mass_kick_monitor(client, update):
         print(f"⚠️ Admin {actor_id} kick count: {count}/{KICK_THRESHOLD} in last {KICK_WINDOW}s")
 
         if count >= KICK_THRESHOLD:
-            # Reset tracker immediately to avoid repeat triggers
             kick_tracker[chat_id][actor_id] = []
-
             actor_name = getattr(actor, 'first_name', None) or str(actor_id)
 
-            # Demote: promote with zero rights = demote
             try:
-                await app.promote_chat_member(
-                    chat_id,
-                    actor_id,
-                    privileges=None  # strips all admin rights
-                )
+                await app.promote_chat_member(chat_id, actor_id, privileges=None)
                 demoted = True
                 print(f"🛡️ Auto-demoted admin {actor_name} ({actor_id}) for mass-kick!")
             except Exception as e:
                 demoted = False
                 print(f"❌ Demote failed for {actor_id}: {e}")
 
-            # DM owner
             dm_text = (
                 f"🚨 **Anti-Mass-Kick Alert**\n"
                 f"━━━━━━━━━━━━━━━━\n"
@@ -1097,20 +948,12 @@ async def anti_mass_kick_monitor(client, update):
             except Exception as e:
                 print(f"❌ Owner DM failed: {e}")
 
-            # Also log to log channel
-            await send_log(
-                "🛡️ Auto-Demoted (Mass Kick)",
-                actor_name, actor_id, chat_id,
-                f"Kicked {count} members in {KICK_WINDOW}s — admin privileges removed"
-            )
+            await send_log("🛡️ Auto-Demoted (Mass Kick)", actor_name, actor_id, chat_id,
+                f"Kicked {count} members in {KICK_WINDOW}s — admin privileges removed")
 
     except Exception as e:
         print(f"❌ anti_mass_kick_monitor error: {e}")
 
-
-# ============================================
-# 🚀 MAIN
-# ============================================
 async def main():
     await app.start()
     me = await app.get_me()
@@ -1122,10 +965,11 @@ async def main():
     for chat_id in ALLOWED_GROUPS:
         for attempt in range(5):
             try:
-                chat_info = await app.get_chat(chat_id)
-                await app.invoke(
-                    GetFullChannel(channel=await app.resolve_peer(chat_id))
-                )
+                username = GROUP_USERNAMES.get(chat_id)
+                if username:
+                    chat_info = await app.get_chat(username)
+                else:
+                    chat_info = await app.get_chat(chat_id)
                 print(f"✅ Peer registered: {chat_info.title} ({chat_id})")
                 break
             except Exception as e:
