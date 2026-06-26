@@ -18,8 +18,8 @@ def now_ist():
     return datetime.now(IST).strftime("%I:%M:%S %p")
 
 # --- FILL THESE ---
-API_ID = 37959432
-API_HASH = "8103d45ba96c1f327f8d44b1004ad92c"
+API_ID = 35833017
+API_HASH = "8d221b416f087bce6be40275d144a203"
 LOG_CHANNEL = "@ghiqty"
 OWNER_ID = 8834161906
 ALLOWED_GROUPS = [-1004341687970]
