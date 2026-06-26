@@ -1,7 +1,7 @@
-# update 2
 from pyrogram import Client, enums, filters
 from pyrogram.raw.functions.phone import GetGroupCall, EditGroupCallParticipant
-from pyrogram.raw.functions.channels import GetFullChannel
+from pyrogram.raw.functions.channels import GetFullChannel, GetAdminLog
+from pyrogram.raw.types import ChannelAdminLogEventsFilter
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ChatPrivileges
 from datetime import datetime
 import sqlite3
@@ -52,6 +52,13 @@ video_muted = {}
 kick_tracker = {}
 KICK_THRESHOLD = 10
 KICK_WINDOW    = 60
+
+# ============================================
+# 🛡️ ANTI-MASS-KICK — ADMIN LOG POLLER SETTINGS
+# ============================================
+EVENT_LOG_POLL_INTERVAL = 5  # seconds
+last_event_log_id = {}       # {chat_id: max_id_seen}
+ADMIN_LOG_DEBUG = True        # set to False once you've confirmed it's working
 
 import pyrogram.client as _pyro_client
 _orig_handle_updates = _pyro_client.Client.handle_updates
@@ -869,6 +876,11 @@ async def poll_muted_users():
 
 @app.on_chat_member_updated()
 async def anti_mass_kick_monitor(client, update):
+    """
+    Kept as a best-effort backup. May not fire reliably for bans performed by
+    other admins on a pyrogram userbot session — see poll_admin_kick_log()
+    below, which is the reliable path and does not depend on this handler.
+    """
     try:
         chat_id = update.chat.id
         if chat_id not in ALLOWED_GROUPS:
@@ -921,52 +933,165 @@ async def anti_mass_kick_monitor(client, update):
         kick_tracker[chat_id][actor_id].append(now)
 
         count = len(kick_tracker[chat_id][actor_id])
-        print(f"⚠️ Admin {actor_id} kick count: {count}/{KICK_THRESHOLD} in last {KICK_WINDOW}s")
+        print(f"⚠️ [EVENT] Admin {actor_id} kick count: {count}/{KICK_THRESHOLD} in last {KICK_WINDOW}s")
 
         if count >= KICK_THRESHOLD:
-            kick_tracker[chat_id][actor_id] = []
-            actor_name = getattr(actor, 'first_name', None) or str(actor_id)
-
-            try:
-                await app.promote_chat_member(
-                    chat_id,
-                    actor_id,
-                    privileges=ChatPrivileges(
-                        can_manage_chat=False,
-                        can_delete_messages=False,
-                        can_manage_video_chats=False,
-                        can_restrict_members=False,
-                        can_promote_members=False,
-                        can_change_info=False,
-                        can_invite_users=False,
-                        can_pin_messages=False,
-                    )
-                )
-                demoted = True
-                print(f"🛡️ Auto-demoted admin {actor_name} ({actor_id}) for mass-kick!")
-            except Exception as e:
-                demoted = False
-                print(f"❌ Demote failed for {actor_id}: {e}")
-
-            dm_text = (
-                f"🚨 **Anti-Mass-Kick Alert**\n"
-                f"━━━━━━━━━━━━━━━━\n"
-                f"👤 **Admin:** [{actor_name}](tg://user?id={actor_id}) (`{actor_id}`)\n"
-                f"👥 **Group:** `{chat_id}`\n"
-                f"⚡ **Kicks:** `{count}` in `{KICK_WINDOW}` seconds\n"
-                f"🛡️ **Action:** {'✅ Auto-demoted' if demoted else '❌ Demote failed — please demote manually!'}\n"
-                f"━━━━━━━━━━━━━━━━"
-            )
-            try:
-                await app.send_message(OWNER_ID, dm_text)
-            except Exception as e:
-                print(f"❌ Owner DM failed: {e}")
-
-            await send_log("🛡️ Auto-Demoted (Mass Kick)", actor_name, actor_id, chat_id,
-                f"Kicked {count} members in {KICK_WINDOW}s — admin privileges removed")
+            await _execute_mass_kick_demotion(chat_id, actor_id,
+                getattr(actor, 'first_name', None) or str(actor_id), count, source="EVENT")
 
     except Exception as e:
         print(f"❌ anti_mass_kick_monitor error: {e}")
+
+# ============================================
+# 🛡️ ANTI-MASS-KICK — RELIABLE ADMIN LOG POLLER
+# ============================================
+# pyrogram==2.0.106 userbot sessions do not reliably receive ChatMemberUpdated
+# push-updates for ban/kick actions performed by OTHER admins. This poller
+# pulls the channel admin log directly (channels.GetAdminLog), which does not
+# depend on update dispatch at all — same proven pattern as poll_vc() above.
+#
+# REQUIRES: the userbot account must be an admin with full admin rights in the
+# group (not a restricted/limited admin) to call GetAdminLog. If it lacks
+# permission, you'll see a "lacks admin-log permission" warning in logs below.
+
+async def _execute_mass_kick_demotion(chat_id, actor_id, actor_name, count, source="LOG-POLL"):
+    """Shared demote + alert logic, called by either detection path."""
+    kick_tracker.setdefault(chat_id, {})[actor_id] = []
+
+    try:
+        await app.promote_chat_member(
+            chat_id,
+            actor_id,
+            privileges=ChatPrivileges(
+                can_manage_chat=False,
+                can_delete_messages=False,
+                can_manage_video_chats=False,
+                can_restrict_members=False,
+                can_promote_members=False,
+                can_change_info=False,
+                can_invite_users=False,
+                can_pin_messages=False,
+            )
+        )
+        demoted = True
+        print(f"🛡️ [{source}] Auto-demoted admin {actor_name} ({actor_id}) for mass-kick!")
+    except Exception as e:
+        demoted = False
+        print(f"❌ [{source}] Demote failed for {actor_id}: {e}")
+
+    dm_text = (
+        f"🚨 **Anti-Mass-Kick Alert** (`{source}`)\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"👤 **Admin:** [{actor_name}](tg://user?id={actor_id}) (`{actor_id}`)\n"
+        f"👥 **Group:** `{chat_id}`\n"
+        f"⚡ **Kicks:** `{count}` in `{KICK_WINDOW}` seconds\n"
+        f"🛡️ **Action:** {'✅ Auto-demoted' if demoted else '❌ Demote failed — please demote manually!'}\n"
+        f"━━━━━━━━━━━━━━━━"
+    )
+    try:
+        await app.send_message(OWNER_ID, dm_text)
+    except Exception as e:
+        print(f"❌ Owner DM failed: {e}")
+
+    await send_log("🛡️ Auto-Demoted (Mass Kick)", actor_name, actor_id, chat_id,
+        f"Kicked {count} members in {KICK_WINDOW}s — admin privileges removed")
+
+
+async def poll_admin_kick_log():
+    print("🛡️ Admin-action log poller started!")
+
+    # Initialize last_event_log_id so we don't replay old history on startup
+    for chat_id in ALLOWED_GROUPS:
+        try:
+            peer = await app.resolve_peer(chat_id)
+            result = await app.invoke(
+                GetAdminLog(channel=peer, q="", max_id=0, min_id=0, limit=1)
+            )
+            if ADMIN_LOG_DEBUG:
+                print(f"🔍 [DEBUG] Init GetAdminLog for {chat_id}: {len(result.events)} event(s) returned")
+            last_event_log_id[chat_id] = max((e.id for e in result.events), default=0)
+        except Exception as e:
+            print(f"⚠️ Could not init event log for {chat_id}: {e}")
+            last_event_log_id[chat_id] = 0
+
+    while True:
+        try:
+            for chat_id in ALLOWED_GROUPS:
+                try:
+                    peer = await app.resolve_peer(chat_id)
+                    result = await app.invoke(
+                        GetAdminLog(
+                            channel=peer,
+                            q="",
+                            max_id=0,
+                            min_id=last_event_log_id.get(chat_id, 0),
+                            limit=100,
+                            events_filter=ChannelAdminLogEventsFilter(kick=True, ban=True),
+                        )
+                    )
+                except Exception as e:
+                    if "CHAT_ADMIN_REQUIRED" in str(e) or "ADMIN_RANK" in str(e):
+                        print(f"⚠️ Bot lacks admin-log permission in {chat_id}: {e}")
+                    else:
+                        print(f"⚠️ GetAdminLog error for {chat_id}: {e}")
+                    continue
+
+                if ADMIN_LOG_DEBUG and result.events:
+                    print(f"🔍 [DEBUG] GetAdminLog poll for {chat_id}: {len(result.events)} new event(s)")
+
+                if not result.events:
+                    continue
+
+                events = sorted(result.events, key=lambda e: e.id)
+                max_id_this_batch = last_event_log_id.get(chat_id, 0)
+
+                for event in events:
+                    max_id_this_batch = max(max_id_this_batch, event.id)
+
+                    actor_id = getattr(event, 'user_id', None)
+                    action = event.action
+                    action_name = type(action).__name__
+
+                    if ADMIN_LOG_DEBUG:
+                        print(f"🔍 [DEBUG] Event id={event.id} actor={actor_id} action={action_name}")
+
+                    if "ToggleBan" not in action_name and "Kick" not in action_name and "Leave" not in action_name:
+                        continue
+
+                    if not actor_id or actor_id == OWNER_ID:
+                        continue
+
+                    try:
+                        actor_member = await app.get_chat_member(chat_id, actor_id)
+                        if actor_member.status not in [
+                            enums.ChatMemberStatus.ADMINISTRATOR,
+                            enums.ChatMemberStatus.OWNER,
+                        ]:
+                            continue
+                        actor_name = actor_member.user.first_name or str(actor_id)
+                    except Exception:
+                        continue
+
+                    now = asyncio.get_event_loop().time()
+                    kick_tracker.setdefault(chat_id, {}).setdefault(actor_id, [])
+                    kick_tracker[chat_id][actor_id] = [
+                        t for t in kick_tracker[chat_id][actor_id]
+                        if now - t < KICK_WINDOW
+                    ]
+                    kick_tracker[chat_id][actor_id].append(now)
+
+                    count = len(kick_tracker[chat_id][actor_id])
+                    print(f"⚠️ [LOG-POLL] Admin {actor_name} ({actor_id}) ban/kick count: {count}/{KICK_THRESHOLD}")
+
+                    if count >= KICK_THRESHOLD:
+                        await _execute_mass_kick_demotion(chat_id, actor_id, actor_name, count, source="LOG-POLL")
+
+                last_event_log_id[chat_id] = max_id_this_batch
+
+        except Exception as e:
+            print(f"❌ Admin-log poller error: {e}")
+
+        await asyncio.sleep(EVENT_LOG_POLL_INTERVAL)
 
 async def main():
     await app.start()
@@ -1007,6 +1132,7 @@ async def main():
 
     asyncio.create_task(poll_vc())
     asyncio.create_task(poll_muted_users())
+    asyncio.create_task(poll_admin_kick_log())
     await asyncio.Event().wait()
 
 init_db()
