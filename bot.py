@@ -25,7 +25,7 @@ MOD_LOG_CHANNEL = "@samplebotttttuuuu"    # Important: bans, kicks, mass-kick al
 OWNER_ID = 8834161906
 ALLOWED_GROUPS = [-1004341687970]
 GROUP_USERNAMES = {
-    -1004341687970: "demoatbotttuh"
+    -1004341687970: "@demoatbotttuh"
 }
 ALLOWED_CHANNELS = []
 
