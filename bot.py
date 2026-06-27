@@ -21,11 +21,11 @@ def now_ist():
 API_ID = 35833017
 API_HASH = "8d221b416f087bce6be40275d144a203"
 LOG_CHANNEL = "@ghiqty"                      # VC activity (mute/unmute) — noisy
-MOD_LOG_CHANNEL = "@samplebottttuuu"    # Important: bans, kicks, mass-kick alerts — CHANGE THIS
+MOD_LOG_CHANNEL = "@samplebotttuuu"          # Important: bans, kicks, mass-kick alerts
 OWNER_ID = 8834161906
 ALLOWED_GROUPS = [-1004341687970]
 GROUP_USERNAMES = {
-    -1004341687970: "@demoatbotttuh"
+    -1004341687970: "demoatbottttuh"
 }
 ALLOWED_CHANNELS = []
 
