@@ -18,14 +18,14 @@ def now_ist():
     return datetime.now(IST).strftime("%I:%M:%S %p")
 
 # --- FILL THESE ---
-API_ID = 35833017
-API_HASH = "8d221b416f087bce6be40275d144a203"
-LOG_CHANNEL = "@ghiqty"                      # VC activity (mute/unmute) — noisy
-MOD_LOG_CHANNEL = "@samplebottttuuu"          # Important: bans, kicks, mass-kick alerts
-OWNER_ID = 8834161906
-ALLOWED_GROUPS = [-1004341687970]
+API_ID = 36387015
+API_HASH = "c98e044a1045b7215a49cdd42de5bba2"
+LOG_CHANNEL = "@vc_log"                      # VC activity (mute/unmute) — noisy
+MOD_LOG_CHANNEL = "@mod_log"          # Important: bans, kicks, mass-kick alerts
+OWNER_ID = 6322784551
+ALLOWED_GROUPS = [-1002483433187]
 GROUP_USERNAMES = {
-    -1004341687970: "demoatbottttuh"
+    -100248343318: "tamil_tamilchat1"
 }
 ALLOWED_CHANNELS = []
 
