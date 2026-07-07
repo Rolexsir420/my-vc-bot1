@@ -25,7 +25,7 @@ MOD_LOG_CHANNEL = "@mod_log"          # Important: bans, kicks, mass-kick alerts
 OWNER_ID = 6322784551
 ALLOWED_GROUPS = [-1002483433187]
 GROUP_USERNAMES = {
-    -100248343318: "tamil_tamilchat1"
+    -1002483433187: "tamil_tamilchat1"
 }
 ALLOWED_CHANNELS = []
 
