@@ -18,8 +18,8 @@ def now_ist():
     return datetime.now(IST).strftime("%I:%M:%S %p")
 
 # --- FILL THESE ---
-API_ID = 36387015
-API_HASH = "c98e044a1045b7215a49cdd42de5bba2"
+API_ID = 32276086
+API_HASH = "7329565d1b4e82233ded99fd5f2d282e"
 LOG_CHANNEL = "@vc_log"                      # VC activity (mute/unmute) — noisy
 MOD_LOG_CHANNEL = "@mod_log"          # Important: bans, kicks, mass-kick alerts
 OWNER_ID = 6322784551
