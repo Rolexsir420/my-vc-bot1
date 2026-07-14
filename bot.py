@@ -29,6 +29,13 @@ GROUP_USERNAMES = {
 }
 ALLOWED_CHANNELS = []
 
+# Private log channels have no @username, so Pyrogram needs to "see" them at
+# least once (via join, dialogs sweep, or an incoming message) before it can
+# resolve their peer/access_hash. Invite links are the reliable bootstrap —
+# see poll_admin_kick_log() comments and main() peer registration below.
+LOG_CHANNEL_INVITE = "https://t.me/+jIrtCG0Sv2pjMzU9"
+MOD_LOG_CHANNEL_INVITE = "https://t.me/+Lyd3MN9P0441ZTQ9"
+
 SIGHTENGINE_USER   = "1297817509"
 SIGHTENGINE_SECRET = "DfGeVrNhJQJvBBTehCXkmmgPfru47mhv"
 NSFW_THRESHOLD = 0.6
@@ -1100,12 +1107,66 @@ async def poll_admin_kick_log():
 
         await asyncio.sleep(EVENT_LOG_POLL_INTERVAL)
 
+async def _register_log_channel(label, chat_id, invite_link):
+    """
+    Resolve a private log channel's peer. Private channels have no @username,
+    so if get_chat() fails with 'Peer id invalid' (peer/access_hash not yet
+    cached by this session), fall back to joining via invite link, which
+    always bootstraps the peer cache regardless of prior session state.
+    """
+    for attempt in range(5):
+        try:
+            log_chat = await app.get_chat(chat_id)
+            if log_chat.id != chat_id:
+                print(f"❌ {label} ID MISMATCH: configured {chat_id}, "
+                      f"but resolved to {log_chat.id} ({log_chat.title}). "
+                      f"Update your config to the correct ID.")
+            else:
+                print(f"✅ {label} channel registered: {log_chat.title}")
+            return True
+        except Exception as e:
+            print(f"⚠️ {label} register attempt {attempt+1}/5: {e}")
+            await asyncio.sleep(2)
+
+    if not invite_link:
+        print(f"❌ {label} unresolvable and no invite link configured.")
+        return False
+
+    try:
+        joined = await app.join_chat(invite_link)
+        print(f"✅ {label} joined via invite link: {joined.title}")
+    except Exception as e:
+        # UserAlreadyParticipant / already-joined errors are fine here —
+        # the point is just to force the peer into the session cache.
+        print(f"⚠️ {label} join_chat error (may already be a member): {e}")
+
+    try:
+        log_chat = await app.get_chat(chat_id)
+        if log_chat.id != chat_id:
+            print(f"❌ {label} ID MISMATCH after join: configured {chat_id}, "
+                  f"but resolved to {log_chat.id} ({log_chat.title}). "
+                  f"Update your config to the correct ID.")
+            return False
+        print(f"✅ {label} channel registered after join: {log_chat.title}")
+        return True
+    except Exception as e:
+        print(f"❌ {label} still unresolvable after invite join: {e}")
+        return False
+
 async def main():
     await app.start()
     me = await app.get_me()
     print(f"✅ Logged in as: {me.first_name} ({me.id})")
     print(f"✅ Bot is running!")
     print(f"✅ Monitoring: {ALLOWED_GROUPS}")
+
+    print("🔄 Populating peer cache via dialogs...")
+    try:
+        async for _ in app.get_dialogs():
+            pass
+        print("✅ Dialog cache populated")
+    except Exception as e:
+        print(f"⚠️ get_dialogs error: {e}")
 
     print("🔄 Registering group peers...")
     for chat_id in ALLOWED_GROUPS:
@@ -1123,15 +1184,8 @@ async def main():
                 await asyncio.sleep(2)
 
     print("🔄 Registering log channel peers...")
-    for label, ch in [("VC log", LOG_CHANNEL), ("Mod log", MOD_LOG_CHANNEL)]:
-        for attempt in range(5):
-            try:
-                log_chat = await app.get_chat(ch)
-                print(f"✅ {label} channel registered: {log_chat.title}")
-                break
-            except Exception as e:
-                print(f"⚠️ {label} register attempt {attempt+1}/5: {e}")
-                await asyncio.sleep(2)
+    await _register_log_channel("VC log", LOG_CHANNEL, LOG_CHANNEL_INVITE)
+    await _register_log_channel("Mod log", MOD_LOG_CHANNEL, MOD_LOG_CHANNEL_INVITE)
 
     try:
         await app.send_message(LOG_CHANNEL, "✅ **VC Bot Started!** Now monitoring.")
