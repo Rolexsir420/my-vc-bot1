@@ -20,9 +20,9 @@ def now_ist():
 # --- FILL THESE ---
 API_ID = 32276086
 API_HASH = "7329565d1b4e82233ded99fd5f2d282e"
-LOG_CHANNEL = "@vc_log"                      # VC activity (mute/unmute) — noisy
-MOD_LOG_CHANNEL = "@mod_log"          # Important: bans, kicks, mass-kick alerts
-OWNER_ID = 6322784551
+LOG_CHANNEL = -1003828438934                     # VC activity (mute/unmute) — noisy
+MOD_LOG_CHANNEL = -1004342790189          # Important: bans, kicks, mass-kick alerts
+OWNER_ID = 8311165664
 ALLOWED_GROUPS = [-1002483433187]
 GROUP_USERNAMES = {
     -1002483433187: "tamil_tamilchat1"
