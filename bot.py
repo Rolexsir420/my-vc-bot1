@@ -1452,4 +1452,5 @@ async def main():
     await asyncio.Event().wait()
 
 init_db()
-asyncio.run(main())
+loop = asyncio.get_event_loop()
+loop.run_until_complete(main())
