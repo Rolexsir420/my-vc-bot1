@@ -14,6 +14,22 @@ import tempfile
 
 IST = pytz.timezone('Asia/Kolkata')
 
+# --- TEMPORARY DIAGNOSTIC — remove after checking Railway logs ---
+import sys
+import subprocess
+print(f"🐍 Python version: {sys.version}")
+try:
+    _result = subprocess.run(
+        ["pip", "index", "versions", "py-tgcalls"],
+        capture_output=True, text=True, timeout=15
+    )
+    print("📦 py-tgcalls availability check:")
+    print(_result.stdout)
+    print(_result.stderr)
+except Exception as _e:
+    print(f"⚠️ Version check failed: {_e}")
+# --- END TEMPORARY DIAGNOSTIC ---
+
 def now_ist():
     return datetime.now(IST).strftime("%I:%M:%S %p")
 
