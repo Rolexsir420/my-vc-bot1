@@ -1,4 +1,27 @@
 from pyrogram import Client, enums, filters
+
+# --- TEMPORARY DIAGNOSTIC — remove after checking logs ---
+import pyrogram as _pyrogram_check
+import subprocess as _subprocess_check
+print(f"🔍 pyrogram.__file__: {_pyrogram_check.__file__}")
+print(f"🔍 pyrogram.__version__: {getattr(_pyrogram_check, '__version__', 'UNKNOWN')}")
+try:
+    _pip_result = _subprocess_check.run(
+        ["pip", "show", "pyrogram", "Kurigram"],
+        capture_output=True, text=True, timeout=15
+    )
+    print("🔍 pip show pyrogram / Kurigram:")
+    print(_pip_result.stdout)
+    print(_pip_result.stderr)
+except Exception as _e:
+    print(f"⚠️ pip show check failed: {_e}")
+try:
+    from pyrogram.errors import GroupcallForbidden
+    print("✅ GroupcallForbidden import succeeded")
+except ImportError as _e:
+    print(f"❌ GroupcallForbidden import FAILED: {_e}")
+# --- END TEMPORARY DIAGNOSTIC ---
+
 from pyrogram.raw.functions.phone import GetGroupCall, EditGroupCallParticipant
 from pyrogram.raw.functions.channels import GetFullChannel, GetAdminLog
 from pyrogram.raw.types import ChannelAdminLogEventsFilter
