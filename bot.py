@@ -3,6 +3,9 @@ from pyrogram.raw.functions.phone import GetGroupCall, EditGroupCallParticipant
 from pyrogram.raw.functions.channels import GetFullChannel, GetAdminLog
 from pyrogram.raw.types import ChannelAdminLogEventsFilter
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ChatPrivileges
+from pytgcalls import PyTgCalls
+from pytgcalls.exceptions import NoActiveGroupCall
+from pydub import AudioSegment
 from datetime import datetime
 import sqlite3
 import re
@@ -13,22 +16,6 @@ import os
 import tempfile
 
 IST = pytz.timezone('Asia/Kolkata')
-
-# --- TEMPORARY DIAGNOSTIC — remove after checking Railway logs ---
-import sys
-import subprocess
-print(f"🐍 Python version: {sys.version}")
-try:
-    _result = subprocess.run(
-        ["pip", "index", "versions", "py-tgcalls"],
-        capture_output=True, text=True, timeout=15
-    )
-    print("📦 py-tgcalls availability check:")
-    print(_result.stdout)
-    print(_result.stderr)
-except Exception as _e:
-    print(f"⚠️ Version check failed: {_e}")
-# --- END TEMPORARY DIAGNOSTIC ---
 
 def now_ist():
     return datetime.now(IST).strftime("%I:%M:%S %p")
@@ -66,6 +53,19 @@ app = Client(
     api_hash=API_HASH,
     session_string=SESSION_STRING
 )
+
+# Used only on-demand by /checkvc — the bot does NOT stay connected to VC
+# audio permanently. It joins briefly to record, analyzes, then leaves.
+tg_calls = PyTgCalls(app)
+
+# How long to record when /checkvc is run, and the loudness threshold (in
+# dBFS — 0 is the loudest possible, more negative = quieter) above which a
+# window counts as "real audio detected." -40 dBFS is a reasonable starting
+# point for "someone is clearly talking" vs. background hiss; tune based on
+# what you see in real /checkvc runs.
+VC_CHECK_DURATION_SECONDS = 15
+VC_CHECK_LOUD_THRESHOLD_DBFS = -40
+VC_CHECK_WINDOW_MS = 500
 
 vc_members = {}
 muted_in_vc = {}
@@ -672,6 +672,131 @@ async def admin_unmute(client, message):
     else:
         await message.reply(f"⚠️ Could not unmute **{first_name}** — they may not be in VC.")
 
+def _analyze_recording(filepath):
+    """
+    Reads the recorded VC audio and returns a list of (start_seconds, dBFS)
+    per window, plus the list of windows that exceeded the loud threshold.
+    dBFS is loudness relative to max possible (0 = loudest, more negative =
+    quieter/silence). This is independent of whatever "speaking" state the
+    Telegram client reports — it's measuring the actual decoded audio.
+    """
+    seg = AudioSegment.from_file(filepath)
+    windows = []
+    loud_windows = []
+    for start_ms in range(0, len(seg), VC_CHECK_WINDOW_MS):
+        chunk = seg[start_ms:start_ms + VC_CHECK_WINDOW_MS]
+        db = chunk.dBFS
+        # dBFS can be -inf on pure digital silence; normalize for comparison
+        if db == float("-inf"):
+            db = -100.0
+        t = start_ms / 1000
+        windows.append((t, db))
+        if db > VC_CHECK_LOUD_THRESHOLD_DBFS:
+            loud_windows.append((t, db))
+    return windows, loud_windows
+
+@app.on_message(filters.command("checkvc") & filters.group)
+async def check_vc_audio(client, message):
+    chat_id = message.chat.id
+    if chat_id not in ALLOWED_GROUPS:
+        return
+
+    try:
+        sender = await app.get_chat_member(chat_id, message.from_user.id)
+        if sender.status not in [
+            enums.ChatMemberStatus.ADMINISTRATOR,
+            enums.ChatMemberStatus.OWNER
+        ] and message.from_user.id != OWNER_ID:
+            return
+    except Exception:
+        return
+
+    status_msg = await message.reply(
+        f"🔎 Checking voice chat for hidden speakers... ({VC_CHECK_DURATION_SECONDS}s, please wait)"
+    )
+
+    tmp_path = tempfile.mktemp(suffix=".mp3")
+
+    try:
+        # Snapshot who Telegram currently reports as unmuted/eligible to speak,
+        # BEFORE recording, for cross-reference in the report.
+        try:
+            participants = await tg_calls.get_participants(chat_id)
+            reported_unmuted = [
+                p.user_id for p in (participants or [])
+                if not p.muted and not p.muted_by_admin
+            ]
+        except Exception as e:
+            reported_unmuted = []
+            print(f"⚠️ get_participants error before check: {e}")
+
+        await tg_calls.record(chat_id, tmp_path)
+        await asyncio.sleep(VC_CHECK_DURATION_SECONDS)
+
+        try:
+            await tg_calls.leave_call(chat_id)
+        except Exception as e:
+            print(f"⚠️ leave_call after check error: {e}")
+
+        if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+            await status_msg.edit_text("⚠️ Could not capture any audio — is the voice chat active?")
+            return
+
+        windows, loud_windows = _analyze_recording(tmp_path)
+
+        unmuted_names = []
+        for uid in reported_unmuted:
+            try:
+                u = await app.get_users(uid)
+                unmuted_names.append(f"{u.first_name or uid} (`{uid}`)")
+            except Exception:
+                unmuted_names.append(f"`{uid}`")
+
+        if loud_windows:
+            loud_times = ", ".join(f"{t:.1f}s" for t, _ in loud_windows[:10])
+            more = f" (+{len(loud_windows)-10} more)" if len(loud_windows) > 10 else ""
+            verdict = (
+                f"🚨 **Real voice activity detected** at: {loud_times}{more}\n"
+                f"Telegram reported these as currently unmutable/speaking-eligible:\n"
+                + ("\n".join(f"• {n}" for n in unmuted_names) if unmuted_names else "• (none reported)")
+                + "\n\n👮 Listen to the attached clip and cross-check against who was actually "
+                  "in the VC at that time to identify the speaker."
+            )
+        else:
+            verdict = "✅ No significant voice activity detected during the check window."
+
+        await app.send_audio(
+            MOD_LOG_CHANNEL,
+            audio=tmp_path,
+            caption=(
+                f"🎙️ **VC Audio Check Result**\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"👥 **Group:** `{chat_id}`\n"
+                f"⏱️ **Duration checked:** {VC_CHECK_DURATION_SECONDS}s\n"
+                f"👮 **Requested by:** {message.from_user.first_name} (`{message.from_user.id}`)\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"{verdict}"
+            )
+        )
+
+        await status_msg.edit_text(
+            "✅ Check complete — result posted to the mod log channel."
+            if loud_windows else
+            "✅ Check complete — no suspicious audio detected."
+        )
+
+    except NoActiveGroupCall:
+        await status_msg.edit_text("⚠️ There's no active voice chat right now.")
+    except Exception as e:
+        print(f"❌ check_vc_audio error: {e}")
+        await status_msg.edit_text(f"❌ Check failed: {e}")
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
 @app.on_message(filters.left_chat_member)
 async def handle_left_group_member(client, message):
     chat_id = message.chat.id
@@ -1255,6 +1380,7 @@ async def _register_log_channel(label, chat_id, invite_link):
 
 async def main():
     await app.start()
+    await tg_calls.start()
     me = await app.get_me()
     print(f"✅ Logged in as: {me.first_name} ({me.id})")
     print(f"✅ Bot is running!")
