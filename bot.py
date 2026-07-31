@@ -1452,4 +1452,4 @@ async def main():
     await asyncio.Event().wait()
 
 init_db()
-app.run(main())
+asyncio.run(main())
