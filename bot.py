@@ -27,8 +27,12 @@ from pyrogram.raw.functions.channels import GetFullChannel, GetAdminLog
 from pyrogram.raw.types import ChannelAdminLogEventsFilter
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ChatPrivileges
 from pytgcalls import PyTgCalls
+from pytgcalls import filters as pytgcalls_filters
+from pytgcalls.types import Direction, Device
 from pytgcalls.exceptions import NoActiveGroupCall
 from pydub import AudioSegment
+import array
+import time as time_module
 from datetime import datetime
 import sqlite3
 import re
@@ -89,6 +93,25 @@ tg_calls = PyTgCalls(app)
 VC_CHECK_DURATION_SECONDS = 15
 VC_CHECK_LOUD_THRESHOLD_DBFS = -40
 VC_CHECK_WINDOW_MS = 500
+
+# --- Real-time hidden-speaker detection ---
+# Unlike /checkvc (one-off mixed-audio check), this listens continuously to
+# each participant's INDIVIDUAL audio source (their ssrc — the per-speaker
+# WebRTC stream id) while a voice chat is active. It cross-references real
+# detected voice energy against Telegram's reported muted state for that
+# exact person, so it can catch a genuinely spoofed "mic hidden" client.
+vc_audio_joined = set()          # chat_ids the audio monitor is currently joined to
+ssrc_to_user = {}                # {chat_id: {ssrc: user_id}}
+ssrc_muted_state = {}            # {chat_id: {user_id: bool}} — refreshed periodically
+ssrc_energy_recent = {}          # {chat_id: {ssrc: [timestamps of recent loud frames]}}
+hidden_speaker_last_alert = {}   # {(chat_id, user_id): last_alert_unix_time}
+
+# Tune these based on real testing — this is a starting point, not a promise
+# of perfect accuracy. RMS is on raw 16-bit PCM samples (0-32767 range).
+HIDDEN_SPEAKER_RMS_THRESHOLD = 500
+HIDDEN_SPEAKER_MIN_LOUD_FRAMES = 5       # loud frames required within the window below
+HIDDEN_SPEAKER_WINDOW_SECONDS = 2        # debounce window — avoids one-off noise spikes
+HIDDEN_SPEAKER_ALERT_COOLDOWN = 30       # don't re-alert the same person more than this often
 
 vc_members = {}
 muted_in_vc = {}
@@ -695,6 +718,129 @@ async def admin_unmute(client, message):
     else:
         await message.reply(f"⚠️ Could not unmute **{first_name}** — they may not be in VC.")
 
+async def _refresh_ssrc_mapping(chat_id):
+    """
+    Periodically maps each participant's ssrc (their individual audio source
+    id) to their user_id and current muted state, so the frame handler below
+    can cross-reference real audio against reported mute status quickly
+    without calling get_participants() on every single audio frame.
+    """
+    try:
+        participants = await tg_calls.get_participants(chat_id)
+        mapping = {}
+        muted_map = {}
+        for p in (participants or []):
+            if getattr(p, 'source', None):
+                mapping[p.source] = p.user_id
+            muted_map[p.user_id] = bool(p.muted or p.muted_by_admin)
+        ssrc_to_user[chat_id] = mapping
+        ssrc_muted_state[chat_id] = muted_map
+    except Exception as e:
+        print(f"⚠️ _refresh_ssrc_mapping error for {chat_id}: {e}")
+
+async def _send_hidden_speaker_alert(chat_id, user_id):
+    try:
+        info = await app.get_users(user_id)
+        first_name = getattr(info, 'first_name', None) or str(user_id)
+    except Exception:
+        first_name = str(user_id)
+    print(f"🚨 Possible hidden speaker: {first_name} ({user_id}) in {chat_id}")
+    await send_log(
+        "🚨 Possible Hidden Speaker Detected",
+        first_name, user_id, chat_id,
+        "Real audio detected from this person's own individual voice stream while "
+        "Telegram reports them as muted — possible mic-hiding modified client. "
+        "This is an automatic alert only; verify and act manually.",
+        channel=MOD_LOG_CHANNEL
+    )
+
+@tg_calls.on_update(pytgcalls_filters.stream_frame(directions=Direction.INCOMING, devices=Device.MICROPHONE))
+async def on_audio_frame(client, update):
+    chat_id = update.chat_id
+    if chat_id not in ALLOWED_GROUPS:
+        return
+
+    mapping = ssrc_to_user.get(chat_id, {})
+    muted_map = ssrc_muted_state.get(chat_id, {})
+    now = time_module.time()
+
+    for frame in update.frames:
+        try:
+            samples = array.array('h', frame.frame)  # 16-bit PCM samples
+        except Exception:
+            continue
+        if not samples:
+            continue
+
+        rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
+        if rms < HIDDEN_SPEAKER_RMS_THRESHOLD:
+            continue
+
+        user_id = mapping.get(frame.ssrc)
+        if not user_id or user_id == OWNER_ID:
+            continue
+        if not muted_map.get(user_id, False):
+            # Real audio, but Telegram also shows them as unmuted — normal,
+            # expected speaking. Nothing suspicious here.
+            continue
+
+        # Real audio + reported muted = the exact mismatch we're looking for.
+        # Debounce: require several loud frames within a short window before
+        # alerting, so one stray noise burst doesn't trigger a false alarm.
+        bucket = ssrc_energy_recent.setdefault(chat_id, {}).setdefault(frame.ssrc, [])
+        bucket.append(now)
+        cutoff = now - HIDDEN_SPEAKER_WINDOW_SECONDS
+        while bucket and bucket[0] < cutoff:
+            bucket.pop(0)
+
+        if len(bucket) >= HIDDEN_SPEAKER_MIN_LOUD_FRAMES:
+            last_alert = hidden_speaker_last_alert.get((chat_id, user_id), 0)
+            if now - last_alert >= HIDDEN_SPEAKER_ALERT_COOLDOWN:
+                hidden_speaker_last_alert[(chat_id, user_id)] = now
+                asyncio.create_task(_send_hidden_speaker_alert(chat_id, user_id))
+            bucket.clear()
+
+async def manage_audio_monitor():
+    """
+    Auto-joins the VC audio stream whenever it's active (reusing the same
+    get_cached_call() check poll_vc() already relies on) and leaves when it
+    ends. While joined, keeps the ssrc->user/muted mapping fresh so the frame
+    handler above can attribute audio correctly.
+    """
+    print("🎧 Hidden-speaker audio monitor started!")
+    while True:
+        try:
+            for chat_id in ALLOWED_GROUPS:
+                call = await get_cached_call(chat_id)
+                is_active = call is not None
+
+                if is_active and chat_id not in vc_audio_joined:
+                    try:
+                        await tg_calls.record(chat_id)  # no file = raw frame delivery
+                        vc_audio_joined.add(chat_id)
+                        print(f"🎧 Audio monitor joined VC: {chat_id}")
+                    except Exception as e:
+                        print(f"⚠️ Audio monitor join failed for {chat_id}: {e}")
+
+                elif not is_active and chat_id in vc_audio_joined:
+                    try:
+                        await tg_calls.leave_call(chat_id)
+                    except Exception:
+                        pass
+                    vc_audio_joined.discard(chat_id)
+                    ssrc_to_user.pop(chat_id, None)
+                    ssrc_muted_state.pop(chat_id, None)
+                    ssrc_energy_recent.pop(chat_id, None)
+                    print(f"🎧 Audio monitor left VC: {chat_id}")
+
+                if chat_id in vc_audio_joined:
+                    await _refresh_ssrc_mapping(chat_id)
+
+        except Exception as e:
+            print(f"❌ Audio monitor manager error: {e}")
+
+        await asyncio.sleep(3)
+
 def _analyze_recording(filepath):
     """
     Reads the recorded VC audio and returns a list of (start_seconds, dBFS)
@@ -1262,6 +1408,22 @@ async def _execute_mass_kick_demotion(chat_id, actor_id, actor_name, count, sour
 async def poll_admin_kick_log():
     print("🛡️ Admin-action log poller started!")
 
+    def _is_genuine_ban_event(action) -> bool:
+        """
+        ChannelAdminLogEventActionParticipantToggleBan fires for ANY change to
+        a participant's banned/restricted state — including an admin muting or
+        restricting a spammer's messaging rights (still a member), or UNDOING
+        a previous ban. None of those are an actual kick. Only count it as a
+        real removal-from-chat if the new state is ChannelParticipantBanned
+        with left=True (Telegram's actual "kicked out" flag).
+        """
+        new_p = getattr(action, 'new_participant', None)
+        if new_p is None:
+            return False
+        if type(new_p).__name__ != 'ChannelParticipantBanned':
+            return False
+        return bool(getattr(new_p, 'left', False))
+
     # Initialize last_event_log_id so we don't replay old history on startup
     for chat_id in ALLOWED_GROUPS:
         try:
@@ -1449,6 +1611,7 @@ async def main():
     asyncio.create_task(poll_vc())
     asyncio.create_task(poll_muted_users())
     asyncio.create_task(poll_admin_kick_log())
+    asyncio.create_task(manage_audio_monitor())
     await asyncio.Event().wait()
 
 init_db()
