@@ -1,27 +1,4 @@
 from pyrogram import Client, enums, filters
-
-# --- TEMPORARY DIAGNOSTIC — remove after checking logs ---
-import pyrogram as _pyrogram_check
-import subprocess as _subprocess_check
-print(f"🔍 pyrogram.__file__: {_pyrogram_check.__file__}")
-print(f"🔍 pyrogram.__version__: {getattr(_pyrogram_check, '__version__', 'UNKNOWN')}")
-try:
-    _pip_result = _subprocess_check.run(
-        ["pip", "show", "pyrogram", "Kurigram"],
-        capture_output=True, text=True, timeout=15
-    )
-    print("🔍 pip show pyrogram / Kurigram:")
-    print(_pip_result.stdout)
-    print(_pip_result.stderr)
-except Exception as _e:
-    print(f"⚠️ pip show check failed: {_e}")
-try:
-    from pyrogram.errors import GroupcallForbidden
-    print("✅ GroupcallForbidden import succeeded")
-except ImportError as _e:
-    print(f"❌ GroupcallForbidden import FAILED: {_e}")
-# --- END TEMPORARY DIAGNOSTIC ---
-
 from pyrogram.raw.functions.phone import GetGroupCall, EditGroupCallParticipant
 from pyrogram.raw.functions.channels import GetFullChannel, GetAdminLog
 from pyrogram.raw.types import ChannelAdminLogEventsFilter
@@ -47,9 +24,9 @@ IST = pytz.timezone('Asia/Kolkata')
 def now_ist():
     return datetime.now(IST).strftime("%I:%M:%S %p")
 
-# --- FILL THESE ---
-API_ID = 32276086
-API_HASH = "7329565d1b4e82233ded99fd5f2d282e"
+# --- FILL THESE (move to Railway env vars — this repo is public!) ---
+API_ID = int(os.environ.get("API_ID", "32276086"))
+API_HASH = os.environ.get("API_HASH", "7329565d1b4e82233ded99fd5f2d282e")
 LOG_CHANNEL = -1003828438934                     # VC activity (mute/unmute) — noisy
 MOD_LOG_CHANNEL = -1004342790189          # Important: bans, kicks, mass-kick alerts
 OWNER_ID = 8311165664
@@ -59,15 +36,13 @@ GROUP_USERNAMES = {
 }
 ALLOWED_CHANNELS = []
 
-# Private log channels have no @username, so Pyrogram needs to "see" them at
-# least once (via join, dialogs sweep, or an incoming message) before it can
-# resolve their peer/access_hash. Invite links are the reliable bootstrap —
-# see poll_admin_kick_log() comments and main() peer registration below.
+DB_PATH = os.environ.get("DB_PATH", "warnings.db")
+
 LOG_CHANNEL_INVITE = "https://t.me/+jIrtCG0Sv2pjMzU9"
 MOD_LOG_CHANNEL_INVITE = "https://t.me/+Lyd3MN9P0441ZTQ9"
 
-SIGHTENGINE_USER   = "1297817509"
-SIGHTENGINE_SECRET = "DfGeVrNhJQJvBBTehCXkmmgPfru47mhv"
+SIGHTENGINE_USER   = os.environ.get("SIGHTENGINE_USER", "1297817509")
+SIGHTENGINE_SECRET = os.environ.get("SIGHTENGINE_SECRET", "DfGeVrNhJQJvBBTehCXkmmgPfru47mhv")
 NSFW_THRESHOLD = 0.6
 
 SESSION_STRING = os.environ.get("SESSION_STRING")
@@ -81,55 +56,37 @@ app = Client(
     session_string=SESSION_STRING
 )
 
-# Used only on-demand by /checkvc — the bot does NOT stay connected to VC
-# audio permanently. It joins briefly to record, analyzes, then leaves.
 tg_calls = PyTgCalls(app)
 
-# How long to record when /checkvc is run, and the loudness threshold (in
-# dBFS — 0 is the loudest possible, more negative = quieter) above which a
-# window counts as "real audio detected." -40 dBFS is a reasonable starting
-# point for "someone is clearly talking" vs. background hiss; tune based on
-# what you see in real /checkvc runs.
 VC_CHECK_DURATION_SECONDS = 15
 VC_CHECK_LOUD_THRESHOLD_DBFS = -40
 VC_CHECK_WINDOW_MS = 500
 
-# --- Real-time hidden-speaker detection ---
-# Unlike /checkvc (one-off mixed-audio check), this listens continuously to
-# each participant's INDIVIDUAL audio source (their ssrc — the per-speaker
-# WebRTC stream id) while a voice chat is active. It cross-references real
-# detected voice energy against Telegram's reported muted state for that
-# exact person, so it can catch a genuinely spoofed "mic hidden" client.
-vc_audio_joined = set()          # chat_ids the audio monitor is currently joined to
-ssrc_to_user = {}                # {chat_id: {ssrc: user_id}}
-ssrc_muted_state = {}            # {chat_id: {user_id: bool}} — refreshed periodically
-ssrc_energy_recent = {}          # {chat_id: {ssrc: [timestamps of recent loud frames]}}
-hidden_speaker_last_alert = {}   # {(chat_id, user_id): last_alert_unix_time}
+vc_audio_joined = set()
+ssrc_to_user = {}
+ssrc_muted_state = {}
+ssrc_energy_recent = {}
+hidden_speaker_last_alert = {}
 
-# Tune these based on real testing — this is a starting point, not a promise
-# of perfect accuracy. RMS is on raw 16-bit PCM samples (0-32767 range).
 HIDDEN_SPEAKER_RMS_THRESHOLD = 500
-HIDDEN_SPEAKER_MIN_LOUD_FRAMES = 5       # loud frames required within the window below
-HIDDEN_SPEAKER_WINDOW_SECONDS = 2        # debounce window — avoids one-off noise spikes
-HIDDEN_SPEAKER_ALERT_COOLDOWN = 30       # don't re-alert the same person more than this often
+HIDDEN_SPEAKER_MIN_LOUD_FRAMES = 5
+HIDDEN_SPEAKER_WINDOW_SECONDS = 2
+HIDDEN_SPEAKER_ALERT_COOLDOWN = 30
 
 vc_members = {}
 muted_in_vc = {}
 vc_channels = {}
 vc_video_users = {}
 video_muted = {}
-vc_admin_muted = {}  # {chat_id: set(user_id)} — last-seen admin force-mute snapshot per poll
+vc_admin_muted = {}
 
 kick_tracker = {}
 KICK_THRESHOLD = 10
 KICK_WINDOW    = 60
 
-# ============================================
-# 🛡️ ANTI-MASS-KICK — ADMIN LOG POLLER SETTINGS
-# ============================================
-EVENT_LOG_POLL_INTERVAL = 5  # seconds
-last_event_log_id = {}       # {chat_id: max_id_seen}
-ADMIN_LOG_DEBUG = True        # set to False once you've confirmed it's working
+EVENT_LOG_POLL_INTERVAL = 5
+last_event_log_id = {}
+ADMIN_LOG_DEBUG = True
 
 import pyrogram.client as _pyro_client
 _orig_handle_updates = _pyro_client.Client.handle_updates
@@ -184,7 +141,7 @@ def invalidate_call_cache(chat_id):
     call_cache_time.pop(chat_id, None)
 
 def init_db():
-    conn = sqlite3.connect("warnings.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS warnings (
@@ -216,7 +173,7 @@ def init_db():
     conn.close()
 
 def add_warning(user_id, chat_id, first_name):
-    conn = sqlite3.connect("warnings.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     now = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
     c.execute("""
@@ -236,7 +193,7 @@ def add_warning(user_id, chat_id, first_name):
     return count
 
 def reset_warnings(user_id, chat_id):
-    conn = sqlite3.connect("warnings.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("DELETE FROM warnings WHERE user_id=? AND chat_id=?",
               (user_id, chat_id))
@@ -244,7 +201,7 @@ def reset_warnings(user_id, chat_id):
     conn.close()
 
 def save_group_member(user_id, chat_id):
-    conn = sqlite3.connect("warnings.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     now = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
     c.execute(
@@ -256,7 +213,7 @@ def save_group_member(user_id, chat_id):
     conn.close()
 
 def remove_group_member(user_id, chat_id):
-    conn = sqlite3.connect("warnings.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
         "DELETE FROM group_members WHERE user_id=? AND chat_id=?",
@@ -266,7 +223,7 @@ def remove_group_member(user_id, chat_id):
     conn.close()
 
 def is_known_member(user_id, chat_id):
-    conn = sqlite3.connect("warnings.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     result = c.execute(
         "SELECT 1 FROM group_members WHERE user_id=? AND chat_id=?",
@@ -276,7 +233,7 @@ def is_known_member(user_id, chat_id):
     return result is not None
 
 def add_admin_mute(user_id, chat_id):
-    conn = sqlite3.connect("warnings.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     now = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
     c.execute(
@@ -287,14 +244,14 @@ def add_admin_mute(user_id, chat_id):
     conn.close()
 
 def remove_admin_mute(user_id, chat_id):
-    conn = sqlite3.connect("warnings.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("DELETE FROM admin_muted WHERE user_id=? AND chat_id=?", (user_id, chat_id))
     conn.commit()
     conn.close()
 
 def is_admin_muted(user_id, chat_id):
-    conn = sqlite3.connect("warnings.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     result = c.execute(
         "SELECT 1 FROM admin_muted WHERE user_id=? AND chat_id=?",
@@ -517,9 +474,6 @@ async def get_vc_participants(chat_id):
         user_ids = set()
         channel_ids = set()
         video_users = set()
-        # muted=True + can_self_unmute=False is Telegram's signature for an
-        # admin-enforced mute (the target cannot unmute themselves). A plain
-        # self-mute or a mute the target CAN undo won't set this.
         admin_force_muted = set()
 
         for p in result.participants:
@@ -733,6 +687,9 @@ async def _refresh_ssrc_mapping(chat_id):
             if getattr(p, 'source', None):
                 mapping[p.source] = p.user_id
             muted_map[p.user_id] = bool(p.muted or p.muted_by_admin)
+            if ADMIN_LOG_DEBUG:
+                print(f"🔍 [SSRC-DEBUG] user={p.user_id} source={getattr(p, 'source', None)} "
+                      f"muted={p.muted} muted_by_admin={p.muted_by_admin}")
         ssrc_to_user[chat_id] = mapping
         ssrc_muted_state[chat_id] = muted_map
     except Exception as e:
@@ -779,6 +736,11 @@ async def on_audio_frame(client, update):
         user_id = mapping.get(frame.ssrc)
         if not user_id or user_id == OWNER_ID:
             continue
+
+        if ADMIN_LOG_DEBUG:
+            print(f"🔍 [AUDIO-DEBUG] ssrc={frame.ssrc} user={user_id} "
+                  f"rms={rms:.0f} reported_muted={muted_map.get(user_id, '???')}")
+
         if not muted_map.get(user_id, False):
             # Real audio, but Telegram also shows them as unmuted — normal,
             # expected speaking. Nothing suspicious here.
@@ -842,20 +804,12 @@ async def manage_audio_monitor():
         await asyncio.sleep(3)
 
 def _analyze_recording(filepath):
-    """
-    Reads the recorded VC audio and returns a list of (start_seconds, dBFS)
-    per window, plus the list of windows that exceeded the loud threshold.
-    dBFS is loudness relative to max possible (0 = loudest, more negative =
-    quieter/silence). This is independent of whatever "speaking" state the
-    Telegram client reports — it's measuring the actual decoded audio.
-    """
     seg = AudioSegment.from_file(filepath)
     windows = []
     loud_windows = []
     for start_ms in range(0, len(seg), VC_CHECK_WINDOW_MS):
         chunk = seg[start_ms:start_ms + VC_CHECK_WINDOW_MS]
         db = chunk.dBFS
-        # dBFS can be -inf on pure digital silence; normalize for comparison
         if db == float("-inf"):
             db = -100.0
         t = start_ms / 1000
@@ -887,8 +841,6 @@ async def check_vc_audio(client, message):
     tmp_path = tempfile.mktemp(suffix=".mp3")
 
     try:
-        # Snapshot who Telegram currently reports as unmuted/eligible to speak,
-        # BEFORE recording, for cross-reference in the report.
         try:
             participants = await tg_calls.get_participants(chat_id)
             reported_unmuted = [
@@ -1146,7 +1098,7 @@ async def poll_vc():
         vc_members[chat_id] = initial_users
         vc_channels[chat_id] = initial_channels
         vc_video_users[chat_id] = initial_video
-        vc_admin_muted[chat_id] = set()  # populated below, on purpose starts empty
+        vc_admin_muted[chat_id] = set()
         muted_in_vc[chat_id] = set()
         print(f"📌 Startup: {len(initial_users)} users, {len(initial_channels)} channels in VC")
 
@@ -1163,8 +1115,6 @@ async def poll_vc():
                     muted_in_vc.get(chat_id, set()).discard(uid)
                     vc_video_users.get(chat_id, set()).discard(uid)
                     video_muted.get(chat_id, set()).discard(uid)
-                    # NOTE: we deliberately do NOT clear admin_muted persistence
-                    # here — that's the whole point, it must survive leave/rejoin.
 
                 for user_id in new_joiners:
                     print(f"🆕 New VC joiner: {user_id}")
@@ -1172,10 +1122,7 @@ async def poll_vc():
 
                 vc_members[chat_id] = current_ids
 
-                # --- Admin force-mute tracking (persists across leave/rejoin) ---
                 previous_admin_muted = vc_admin_muted.get(chat_id, set())
-                # Only count it as "an admin did this" if the bot itself didn't
-                # just mute them (bot mutes are tracked in muted_in_vc).
                 newly_force_muted = (current_admin_muted - previous_admin_muted) - muted_in_vc.get(chat_id, set())
                 no_longer_force_muted = previous_admin_muted - current_admin_muted
 
@@ -1279,11 +1226,6 @@ async def poll_muted_users():
 
 @app.on_chat_member_updated()
 async def anti_mass_kick_monitor(client, update):
-    """
-    Kept as a best-effort backup. May not fire reliably for bans performed by
-    other admins on a pyrogram userbot session — see poll_admin_kick_log()
-    below, which is the reliable path and does not depend on this handler.
-    """
     try:
         chat_id = update.chat.id
         if chat_id not in ALLOWED_GROUPS:
@@ -1345,20 +1287,7 @@ async def anti_mass_kick_monitor(client, update):
     except Exception as e:
         print(f"❌ anti_mass_kick_monitor error: {e}")
 
-# ============================================
-# 🛡️ ANTI-MASS-KICK — RELIABLE ADMIN LOG POLLER
-# ============================================
-# pyrogram==2.0.106 userbot sessions do not reliably receive ChatMemberUpdated
-# push-updates for ban/kick actions performed by OTHER admins. This poller
-# pulls the channel admin log directly (channels.GetAdminLog), which does not
-# depend on update dispatch at all — same proven pattern as poll_vc() above.
-#
-# REQUIRES: the userbot account must be an admin with full admin rights in the
-# group (not a restricted/limited admin) to call GetAdminLog. If it lacks
-# permission, you'll see a "lacks admin-log permission" warning in logs below.
-
 async def _execute_mass_kick_demotion(chat_id, actor_id, actor_name, count, source="LOG-POLL"):
-    """Shared demote + alert logic, called by either detection path."""
     kick_tracker.setdefault(chat_id, {})[actor_id] = []
 
     try:
@@ -1409,14 +1338,6 @@ async def poll_admin_kick_log():
     print("🛡️ Admin-action log poller started!")
 
     def _is_genuine_ban_event(action) -> bool:
-        """
-        ChannelAdminLogEventActionParticipantToggleBan fires for ANY change to
-        a participant's banned/restricted state — including an admin muting or
-        restricting a spammer's messaging rights (still a member), or UNDOING
-        a previous ban. None of those are an actual kick. Only count it as a
-        real removal-from-chat if the new state is ChannelParticipantBanned
-        with left=True (Telegram's actual "kicked out" flag).
-        """
         new_p = getattr(action, 'new_participant', None)
         if new_p is None:
             return False
@@ -1424,7 +1345,6 @@ async def poll_admin_kick_log():
             return False
         return bool(getattr(new_p, 'left', False))
 
-    # Initialize last_event_log_id so we don't replay old history on startup
     for chat_id in ALLOWED_GROUPS:
         try:
             peer = await app.resolve_peer(chat_id)
@@ -1518,12 +1438,6 @@ async def poll_admin_kick_log():
         await asyncio.sleep(EVENT_LOG_POLL_INTERVAL)
 
 async def _register_log_channel(label, chat_id, invite_link):
-    """
-    Resolve a private log channel's peer. Private channels have no @username,
-    so if get_chat() fails with 'Peer id invalid' (peer/access_hash not yet
-    cached by this session), fall back to joining via invite link, which
-    always bootstraps the peer cache regardless of prior session state.
-    """
     for attempt in range(5):
         try:
             log_chat = await app.get_chat(chat_id)
@@ -1546,8 +1460,6 @@ async def _register_log_channel(label, chat_id, invite_link):
         joined = await app.join_chat(invite_link)
         print(f"✅ {label} joined via invite link: {joined.title}")
     except Exception as e:
-        # UserAlreadyParticipant / already-joined errors are fine here —
-        # the point is just to force the peer into the session cache.
         print(f"⚠️ {label} join_chat error (may already be a member): {e}")
 
     try:
