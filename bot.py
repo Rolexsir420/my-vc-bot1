@@ -76,6 +76,9 @@ hidden_speaker_last_alert = {}
 real_speaker_last_seen = {}      # {chat_id: {user_id: last_loud_unix_time}}
 REAL_SPEAKER_RECENT_WINDOW = 10  # seconds — how "recent" counts as "currently speaking"
 
+# Throttle state for the raw-frame diagnostic print in on_audio_frame
+_raw_debug_last_log = {}         # {chat_id: last_print_unix_time}
+
 HIDDEN_SPEAKER_RMS_THRESHOLD = 500
 HIDDEN_SPEAKER_MIN_LOUD_FRAMES = 5
 HIDDEN_SPEAKER_WINDOW_SECONDS = 2
@@ -729,15 +732,22 @@ async def on_audio_frame(client, update):
     muted_map = ssrc_muted_state.get(chat_id, {})
     now = time_module.time()
 
+    frame_count = len(update.frames)
+    loudest_this_call = 0.0
+
     for frame in update.frames:
         try:
             samples = array.array('h', frame.frame)  # 16-bit PCM samples
-        except Exception:
+        except Exception as e:
+            if ADMIN_LOG_DEBUG:
+                print(f"⚠️ [AUDIO-DEBUG] frame parse error ssrc={getattr(frame, 'ssrc', '?')}: {e}")
             continue
         if not samples:
             continue
 
         rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
+        loudest_this_call = max(loudest_this_call, rms)
+
         if rms < HIDDEN_SPEAKER_RMS_THRESHOLD:
             continue
 
@@ -774,6 +784,19 @@ async def on_audio_frame(client, update):
                 hidden_speaker_last_alert[(chat_id, user_id)] = now
                 asyncio.create_task(_send_hidden_speaker_alert(chat_id, user_id))
             bucket.clear()
+
+    # Throttled raw confirmation — proves the handler is firing and shows the
+    # loudest RMS seen this call, EVEN IF it never crossed the alert threshold.
+    # If this line never appears at all in your logs, on_audio_frame is not
+    # being invoked (record() isn't delivering frames) — that's the real bug.
+    # If it appears but rms stays near 0 while someone is clearly talking,
+    # the frames contain silence/garbage — likely a pytgcalls/record() config
+    # issue, not a threshold-tuning issue.
+    last_log = _raw_debug_last_log.get(chat_id, 0)
+    if now - last_log >= 3:
+        _raw_debug_last_log[chat_id] = now
+        print(f"🔍 [RAW-DEBUG] chat={chat_id} frames_this_call={frame_count} "
+              f"loudest_rms={loudest_this_call:.0f} threshold={HIDDEN_SPEAKER_RMS_THRESHOLD}")
 
 async def manage_audio_monitor():
     """
