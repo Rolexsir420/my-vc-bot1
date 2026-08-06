@@ -68,6 +68,14 @@ ssrc_muted_state = {}
 ssrc_energy_recent = {}
 hidden_speaker_last_alert = {}
 
+# Tracks real audio activity regardless of reported mute state, for the
+# on-demand /whospeaking command. This sidesteps entirely the question of
+# whether a modded client's fake mute actually reaches Telegram's servers —
+# it just reports "this person is genuinely producing audio right now,"
+# and the admin cross-references that against who looks muted on-screen.
+real_speaker_last_seen = {}      # {chat_id: {user_id: last_loud_unix_time}}
+REAL_SPEAKER_RECENT_WINDOW = 10  # seconds — how "recent" counts as "currently speaking"
+
 HIDDEN_SPEAKER_RMS_THRESHOLD = 500
 HIDDEN_SPEAKER_MIN_LOUD_FRAMES = 5
 HIDDEN_SPEAKER_WINDOW_SECONDS = 2
@@ -741,6 +749,11 @@ async def on_audio_frame(client, update):
             print(f"🔍 [AUDIO-DEBUG] ssrc={frame.ssrc} user={user_id} "
                   f"rms={rms:.0f} reported_muted={muted_map.get(user_id, '???')}")
 
+        # Always record real activity for /whospeaking, independent of the
+        # muted-flag comparison below — this is what makes /whospeaking work
+        # even if a modded client's mute never touches Telegram's servers.
+        real_speaker_last_seen.setdefault(chat_id, {})[user_id] = now
+
         if not muted_map.get(user_id, False):
             # Real audio, but Telegram also shows them as unmuted — normal,
             # expected speaking. Nothing suspicious here.
@@ -793,6 +806,7 @@ async def manage_audio_monitor():
                     ssrc_to_user.pop(chat_id, None)
                     ssrc_muted_state.pop(chat_id, None)
                     ssrc_energy_recent.pop(chat_id, None)
+                    real_speaker_last_seen.pop(chat_id, None)
                     print(f"🎧 Audio monitor left VC: {chat_id}")
 
                 if chat_id in vc_audio_joined:
@@ -817,6 +831,75 @@ def _analyze_recording(filepath):
         if db > VC_CHECK_LOUD_THRESHOLD_DBFS:
             loud_windows.append((t, db))
     return windows, loud_windows
+
+@app.on_message(filters.command("whospeaking") & filters.group)
+async def who_speaking(client, message):
+    """
+    On-demand: lists everyone whose mic produced real, decoded audio in the
+    last REAL_SPEAKER_RECENT_WINDOW seconds, alongside what Telegram's
+    servers currently report their muted state as. This works no matter
+    what a modded client fakes visually, since it's reading the actual
+    decoded WebRTC audio, not any client-reported status.
+
+    Usage: run this WHILE watching the VC panel yourself. Anyone listed here
+    who looks muted/silent on your screen is the mismatch you're looking for.
+    """
+    chat_id = message.chat.id
+    if chat_id not in ALLOWED_GROUPS:
+        return
+
+    try:
+        sender = await app.get_chat_member(chat_id, message.from_user.id)
+        if sender.status not in [
+            enums.ChatMemberStatus.ADMINISTRATOR,
+            enums.ChatMemberStatus.OWNER
+        ] and message.from_user.id != OWNER_ID:
+            return
+    except Exception:
+        return
+
+    if chat_id not in vc_audio_joined:
+        await message.reply(
+            "⚠️ Audio monitor isn't currently attached to this VC "
+            "(no active voice chat detected, or it just started — wait a few seconds and retry)."
+        )
+        return
+
+    now = time_module.time()
+    cutoff = now - REAL_SPEAKER_RECENT_WINDOW
+    recent = real_speaker_last_seen.get(chat_id, {})
+    muted_map = ssrc_muted_state.get(chat_id, {})
+
+    active = [(uid, ts) for uid, ts in recent.items() if ts >= cutoff]
+    active.sort(key=lambda x: -x[1])  # most recently active first
+
+    if not active:
+        await message.reply(
+            f"🔇 No real audio activity detected from anyone in the last "
+            f"{REAL_SPEAKER_RECENT_WINDOW}s."
+        )
+        return
+
+    lines = [f"🎙️ **Real audio activity — last {REAL_SPEAKER_RECENT_WINDOW}s**\n"
+             f"Cross-check against who looks muted/silent on your screen:\n"]
+
+    for uid, ts in active:
+        try:
+            u = await app.get_users(uid)
+            name = u.first_name or str(uid)
+        except Exception:
+            name = str(uid)
+        seconds_ago = now - ts
+        reported_muted = muted_map.get(uid, "unknown")
+        mute_flag = "🔒 reported MUTED" if reported_muted is True else (
+            "🔓 reported unmuted" if reported_muted is False else "❓ unknown"
+        )
+        lines.append(
+            f"• [{name}](tg://user?id={uid}) (`{uid}`) — "
+            f"last heard {seconds_ago:.1f}s ago — {mute_flag}"
+        )
+
+    await message.reply("\n".join(lines))
 
 @app.on_message(filters.command("checkvc") & filters.group)
 async def check_vc_audio(client, message):
