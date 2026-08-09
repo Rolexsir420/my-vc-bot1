@@ -1,7 +1,7 @@
-Kurigram
+pyrogram==2.0.106
 tgcrypto
 pytz
 aiohttp
-py-tgcalls
-pydub
-audioop-lts; python_version >= "3.13"
+
+
+this is my current requirement
