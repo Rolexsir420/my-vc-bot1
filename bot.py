@@ -20,7 +20,7 @@ def now_ist():
 # --- FILL THESE ---
 API_ID = 32276086
 API_HASH = "7329565d1b4e82233ded99fd5f2d282e"
-LOG_CHANNEL = -1003828438934              # VC activity (mute/unmute) — noisy
+LOG_CHANNEL = -1003828438934                     # VC activity (mute/unmute) — noisy
 MOD_LOG_CHANNEL = -1004342790189          # Important: bans, kicks, mass-kick alerts
 OWNER_ID = 8311165664
 ALLOWED_GROUPS = [-1002483433187]
@@ -31,7 +31,8 @@ ALLOWED_CHANNELS = []
 
 # Private log channels have no @username, so Pyrogram needs to "see" them at
 # least once (via join, dialogs sweep, or an incoming message) before it can
-# resolve their peer/access_hash. Invite links are the reliable bootstrap.
+# resolve their peer/access_hash. Invite links are the reliable bootstrap —
+# see poll_admin_kick_log() comments and main() peer registration below.
 LOG_CHANNEL_INVITE = "https://t.me/+jIrtCG0Sv2pjMzU9"
 MOD_LOG_CHANNEL_INVITE = "https://t.me/+Lyd3MN9P0441ZTQ9"
 
@@ -50,44 +51,12 @@ app = Client(
     session_string=SESSION_STRING
 )
 
-# ============================================================
-# MUTE OWNERSHIP MODEL  (this is the core of the bug fix)
-# ============================================================
-# Telegram exposes NO way to tell who muted a VC participant.
-# A bot mute and an admin mute look byte-identical on the wire:
-#     muted=True  AND  can_self_unmute=False
-#
-# The old code distinguished them with the in-memory set `muted_in_vc`.
-# That set is wiped on every restart, so after a restart every user the
-# bot had muted looked like a brand-new *admin* mute, got written into
-# the admin_muted table, and became permanently un-unmutable:
-#   - instant_unmute_if_in_vc() returns early on is_admin_muted()
-#   - poll_muted_users() `continue`s on is_admin_muted()
-#   - handle_vc_join() re-mutes them on rejoin
-# => "user joins the group but never gets unmuted in VC"
-#
-# Fix: every mute the bot performs is written to a persistent `bot_muted`
-# table with a REASON, so mute ownership survives restarts. A force-mute
-# is only attributed to an admin when it is NOT ours, is not within the
-# grace window of one of our own API calls, and is still present after a
-# confirmation delay (kills the snapshot race).
-# ============================================================
-
-# Reasons that the bot itself is allowed to auto-clear once the user
-# actually becomes a group member:
-AUTO_CLEARABLE_REASONS = {"not_member"}
-# Reasons that stay until an admin runs /unmute:
-STICKY_REASONS = {"video", "bio_link"}
-
-ADMIN_MUTE_CONFIRM_SECONDS = 6   # force-mute must persist this long before we call it an admin mute
-BOT_ACTION_GRACE = 12            # ignore force-mute state this soon after our own mute/unmute call
-
 vc_members = {}
-muted_in_vc = {}          # in-memory mirror of bot_muted, rebuilt from DB on startup
+muted_in_vc = {}
 vc_channels = {}
 vc_video_users = {}
-pending_admin_mute = {}   # {chat_id: {user_id: first_seen_monotonic}}
-recent_bot_action = {}    # {(chat_id, user_id): monotonic} — set on every bot mute/unmute
+video_muted = {}
+vc_admin_muted = {}  # {chat_id: set(user_id)} — last-seen admin force-mute snapshot per poll
 
 kick_tracker = {}
 KICK_THRESHOLD = 10
@@ -98,7 +67,7 @@ KICK_WINDOW    = 60
 # ============================================
 EVENT_LOG_POLL_INTERVAL = 5  # seconds
 last_event_log_id = {}       # {chat_id: max_id_seen}
-ADMIN_LOG_DEBUG = True       # set to False once you've confirmed it's working
+ADMIN_LOG_DEBUG = True        # set to False once you've confirmed it's working
 
 import pyrogram.client as _pyro_client
 _orig_handle_updates = _pyro_client.Client.handle_updates
@@ -118,22 +87,8 @@ call_cache = {}
 call_cache_time = {}
 CACHE_TTL = 30
 
-
-def _mono():
-    return asyncio.get_event_loop().time()
-
-
-def _mark_bot_action(chat_id, user_id):
-    recent_bot_action[(chat_id, user_id)] = _mono()
-
-
-def _in_bot_grace(chat_id, user_id):
-    ts = recent_bot_action.get((chat_id, user_id))
-    return ts is not None and (_mono() - ts) < BOT_ACTION_GRACE
-
-
 async def get_cached_call(chat_id):
-    now = _mono()
+    now = asyncio.get_event_loop().time()
     if (chat_id in call_cache and
             now - call_cache_time.get(chat_id, 0) < CACHE_TTL):
         return call_cache[chat_id]
@@ -166,11 +121,6 @@ def invalidate_call_cache(chat_id):
     call_cache.pop(chat_id, None)
     call_cache_time.pop(chat_id, None)
 
-
-# ============================================
-# DATABASE
-# ============================================
-
 def init_db():
     conn = sqlite3.connect("warnings.db")
     c = conn.cursor()
@@ -196,16 +146,6 @@ def init_db():
         CREATE TABLE IF NOT EXISTS admin_muted (
             user_id   INTEGER,
             chat_id   INTEGER,
-            muted_at  TEXT,
-            PRIMARY KEY (user_id, chat_id)
-        )
-    """)
-    # NEW: persistent record of mutes performed BY THE BOT, with a reason.
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS bot_muted (
-            user_id   INTEGER,
-            chat_id   INTEGER,
-            reason    TEXT,
             muted_at  TEXT,
             PRIMARY KEY (user_id, chat_id)
         )
@@ -301,59 +241,6 @@ def is_admin_muted(user_id, chat_id):
     conn.close()
     return result is not None
 
-def get_admin_muted_users(chat_id):
-    conn = sqlite3.connect("warnings.db")
-    c = conn.cursor()
-    rows = c.execute("SELECT user_id FROM admin_muted WHERE chat_id=?", (chat_id,)).fetchall()
-    conn.close()
-    return {r[0] for r in rows}
-
-# ---------- bot_muted helpers (NEW) ----------
-
-def add_bot_mute(user_id, chat_id, reason):
-    conn = sqlite3.connect("warnings.db")
-    c = conn.cursor()
-    now = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
-    c.execute(
-        "INSERT OR REPLACE INTO bot_muted (user_id, chat_id, reason, muted_at) VALUES (?, ?, ?, ?)",
-        (user_id, chat_id, reason, now)
-    )
-    conn.commit()
-    conn.close()
-    muted_in_vc.setdefault(chat_id, set()).add(user_id)
-
-def remove_bot_mute(user_id, chat_id):
-    conn = sqlite3.connect("warnings.db")
-    c = conn.cursor()
-    c.execute("DELETE FROM bot_muted WHERE user_id=? AND chat_id=?", (user_id, chat_id))
-    conn.commit()
-    conn.close()
-    muted_in_vc.get(chat_id, set()).discard(user_id)
-
-def get_bot_mute_reason(user_id, chat_id):
-    conn = sqlite3.connect("warnings.db")
-    c = conn.cursor()
-    row = c.execute(
-        "SELECT reason FROM bot_muted WHERE user_id=? AND chat_id=?",
-        (user_id, chat_id)
-    ).fetchone()
-    conn.close()
-    return row[0] if row else None
-
-def get_all_bot_mutes(chat_id):
-    conn = sqlite3.connect("warnings.db")
-    c = conn.cursor()
-    rows = c.execute(
-        "SELECT user_id, reason FROM bot_muted WHERE chat_id=?", (chat_id,)
-    ).fetchall()
-    conn.close()
-    return {r[0]: r[1] for r in rows}
-
-
-# ============================================
-# LOGGING
-# ============================================
-
 async def send_log(action, user_name, user_id, chat_id, reason, warns=None, channel=None):
     target_channel = channel or LOG_CHANNEL
     warn_line = f"⚠️ **Warnings:** `{warns}/3`\n" if warns else ""
@@ -382,19 +269,6 @@ def has_group_link(bio):
     return bool(re.search(
         r"(t\.me/joinchat|t\.me/\+)[a-zA-Z0-9_-]+", bio
     ))
-
-
-async def get_name(user_id):
-    try:
-        info = await app.get_users(user_id)
-        return getattr(info, 'first_name', None) or str(user_id)
-    except Exception:
-        return str(user_id)
-
-
-# ============================================
-# NSFW DP CHECK
-# ============================================
 
 async def check_dp_nsfw(user_id):
     tmp_path = None
@@ -535,7 +409,12 @@ async def dp_review_callback(client, callback_query):
                 return
 
         if action == "ban":
-            first_name = await get_name(user_id)
+            try:
+                target = await app.get_users(user_id)
+                first_name = getattr(target, 'first_name', None) or str(user_id)
+            except Exception:
+                first_name = str(user_id)
+
             try:
                 await app.ban_chat_member(chat_id, user_id)
                 await callback_query.edit_message_caption(
@@ -550,7 +429,12 @@ async def dp_review_callback(client, callback_query):
                 await callback_query.answer(f"❌ Ban failed: {e}", show_alert=True)
 
         elif action == "clear":
-            first_name = await get_name(user_id)
+            try:
+                target = await app.get_users(user_id)
+                first_name = getattr(target, 'first_name', None) or str(user_id)
+            except Exception:
+                first_name = str(user_id)
+
             await callback_query.edit_message_caption(
                 f"✅ **Cleared by admin — Not NSFW**\n"
                 f"👤 User: [{first_name}](tg://user?id={user_id}) (`{user_id}`)\n"
@@ -562,11 +446,6 @@ async def dp_review_callback(client, callback_query):
         print(f"❌ dp_review_callback error: {e}")
         await callback_query.answer("❌ Error processing action.", show_alert=True)
 
-
-# ============================================
-# VC PRIMITIVES
-# ============================================
-
 async def get_vc_participants(chat_id):
     try:
         call = await get_cached_call(chat_id)
@@ -576,11 +455,10 @@ async def get_vc_participants(chat_id):
         user_ids = set()
         channel_ids = set()
         video_users = set()
-        # muted=True + can_self_unmute=False is Telegram's signature for a
-        # FORCE mute. Telegram does NOT tell us who did it — the bot and a
-        # human admin produce the exact same flags. Ownership is resolved
-        # later against the persistent bot_muted table.
-        force_muted = set()
+        # muted=True + can_self_unmute=False is Telegram's signature for an
+        # admin-enforced mute (the target cannot unmute themselves). A plain
+        # self-mute or a mute the target CAN undo won't set this.
+        admin_force_muted = set()
 
         for p in result.participants:
             if hasattr(p.peer, 'user_id'):
@@ -589,19 +467,17 @@ async def get_vc_participants(chat_id):
                 if p.video or p.presentation:
                     video_users.add(uid)
                 if getattr(p, 'muted', False) and not getattr(p, 'can_self_unmute', True):
-                    force_muted.add(uid)
+                    admin_force_muted.add(uid)
             elif hasattr(p.peer, 'channel_id'):
                 channel_ids.add(p.peer.channel_id)
 
-        return user_ids, channel_ids, video_users, force_muted
+        return user_ids, channel_ids, video_users, admin_force_muted
     except Exception as e:
         invalidate_call_cache(chat_id)
         print(f"❌ Get VC error: {e}")
         return set(), set(), set(), set()
 
-
-async def mute_in_vc(chat_id, user_id, reason="not_member"):
-    """Mute a user and PERSIST that the bot owns this mute (survives restart)."""
+async def mute_in_vc(chat_id, user_id):
     for attempt in range(3):
         try:
             call = await get_cached_call(chat_id)
@@ -609,9 +485,10 @@ async def mute_in_vc(chat_id, user_id, reason="not_member"):
                 return False
             user_peer = await app.resolve_peer(user_id)
             await app.invoke(EditGroupCallParticipant(call=call, participant=user_peer, muted=True))
-            add_bot_mute(user_id, chat_id, reason)
-            _mark_bot_action(chat_id, user_id)
-            print(f"🔇 Muted: {user_id} (reason={reason})")
+            print(f"🔇 Muted: {user_id}")
+            if chat_id not in muted_in_vc:
+                muted_in_vc[chat_id] = set()
+            muted_in_vc[chat_id].add(user_id)
             return True
         except Exception as e:
             if "PARTICIPANT_JOIN_MISSING" in str(e):
@@ -622,9 +499,7 @@ async def mute_in_vc(chat_id, user_id, reason="not_member"):
                 return False
     return False
 
-
 async def unmute_in_vc(chat_id, user_id):
-    """Unmute and drop our ownership record."""
     for attempt in range(3):
         try:
             call = await get_cached_call(chat_id)
@@ -632,11 +507,9 @@ async def unmute_in_vc(chat_id, user_id):
                 return False
             user_peer = await app.resolve_peer(user_id)
             await app.invoke(EditGroupCallParticipant(call=call, participant=user_peer, muted=False))
-            remove_bot_mute(user_id, chat_id)
-            _mark_bot_action(chat_id, user_id)
-            # Clear any stale pending admin-mute suspicion for this user.
-            pending_admin_mute.get(chat_id, {}).pop(user_id, None)
             print(f"🔊 Unmuted: {user_id}")
+            if chat_id in muted_in_vc:
+                muted_in_vc[chat_id].discard(user_id)
             return True
         except Exception as e:
             if "PARTICIPANT_JOIN_MISSING" in str(e):
@@ -646,7 +519,6 @@ async def unmute_in_vc(chat_id, user_id):
                 print(f"❌ Unmute error: {e}")
                 return False
     return False
-
 
 async def is_real_member(chat_id, user_id):
     try:
@@ -680,55 +552,27 @@ async def is_real_member(chat_id, user_id):
         print(f"❌ Status check error: {e}")
         return is_known_member(user_id, chat_id)
 
-
-async def is_user_in_vc(chat_id, user_id):
-    """Cached check with a live re-fetch fallback, so a cold/stale cache
-    never causes us to skip an unmute the user is waiting for."""
-    if user_id in vc_members.get(chat_id, set()):
-        return True
-    users, channels, video, force_muted = await get_vc_participants(chat_id)
-    if users:
-        vc_members[chat_id] = users
-        vc_channels[chat_id] = channels
-        vc_video_users[chat_id] = video
-    return user_id in users
-
-
 async def instant_unmute_if_in_vc(chat_id, user_id, first_name, source):
     print(f"⚡ [{source}] {first_name} ({user_id}) joined group!")
     save_group_member(user_id, chat_id)
 
-    # HARD RULE: an admin mute is never touched by automation.
-    if is_admin_muted(user_id, chat_id):
-        print(f"🔒 {first_name} is admin-muted — leaving muted (admin /unmute only)")
-        return
+    current_vc = vc_members.get(chat_id, set())
+    in_vc = user_id in current_vc
+    is_muted = user_id in muted_in_vc.get(chat_id, set())
 
-    reason = get_bot_mute_reason(user_id, chat_id)
-    if reason in STICKY_REASONS:
-        print(f"🔒 {first_name} muted for '{reason}' — admin /unmute only")
-        return
+    print(f"🔍 In VC: {in_vc} | Muted: {is_muted}")
 
-    in_vc = await is_user_in_vc(chat_id, user_id)
-    print(f"🔍 In VC: {in_vc} | Bot-mute reason: {reason}")
-
-    if not in_vc:
+    if in_vc:
+        if is_admin_muted(user_id, chat_id):
+            print(f"🔒 {first_name} in VC but admin-muted — leaving muted")
+            return
+        print(f"🔊 {first_name} in VC — unmuting instantly!")
+        success = await unmute_in_vc(chat_id, user_id)
+        if success:
+            await send_log(f"🔊 Auto Unmuted ({source})", first_name, user_id, chat_id,
+                "Joined group while sitting in VC")
+    else:
         print(f"ℹ️ {first_name} not in VC")
-        return
-
-    print(f"🔊 {first_name} in VC — unmuting instantly!")
-    success = await unmute_in_vc(chat_id, user_id)
-    if success:
-        await send_log(f"🔊 Auto Unmuted ({source})", first_name, user_id, chat_id,
-            "Joined group while sitting in VC")
-
-
-# ============================================
-# MEMBER UPDATE HANDLER
-# ============================================
-# NOTE: Pyrogram executes only the FIRST matching handler per group. The old
-# file registered two @app.on_chat_member_updated() handlers in the default
-# group, so the second one (anti_mass_kick_monitor) was dead code. They are
-# merged here into one handler.
 
 @app.on_chat_member_updated()
 async def on_member_update(client, update):
@@ -736,87 +580,30 @@ async def on_member_update(client, update):
         chat_id = update.chat.id
         if chat_id not in ALLOWED_GROUPS:
             return
+        if not update.new_chat_member:
+            return
 
-        old = update.old_chat_member
-        new = update.new_chat_member
+        new_status = update.new_chat_member.status
+        user = update.new_chat_member.user
+        user_id = user.id
+        first_name = getattr(user, 'first_name', None) or str(user_id)
 
-        # ---------- part 1: instant unmute on join ----------
-        if new:
-            new_status = new.status
-            user = new.user
-            user_id = user.id
-            first_name = getattr(user, 'first_name', None) or str(user_id)
+        print(f"🔄 [EVENT] {first_name} → {new_status}")
 
-            print(f"🔄 [EVENT] {first_name} → {new_status}")
+        if new_status not in [
+            enums.ChatMemberStatus.MEMBER,
+            enums.ChatMemberStatus.ADMINISTRATOR,
+            enums.ChatMemberStatus.OWNER
+        ]:
+            return
 
-            if new_status in [
-                enums.ChatMemberStatus.MEMBER,
-                enums.ChatMemberStatus.ADMINISTRATOR,
-                enums.ChatMemberStatus.OWNER
-            ] and user_id != OWNER_ID:
-                await instant_unmute_if_in_vc(chat_id, user_id, first_name, "Event")
+        if user_id == OWNER_ID:
+            return
 
-        # ---------- part 2: anti-mass-kick (best effort backup) ----------
-        await _event_mass_kick_check(chat_id, old, new, update)
+        await instant_unmute_if_in_vc(chat_id, user_id, first_name, "Event")
 
     except Exception as e:
         print(f"❌ Member update error: {e}")
-
-
-async def _event_mass_kick_check(chat_id, old, new, update):
-    """
-    Best-effort backup for anti-mass-kick. poll_admin_kick_log() is the
-    reliable path — userbot sessions often do not receive ChatMemberUpdated
-    for actions taken by OTHER admins.
-    """
-    try:
-        if not old or not new:
-            return
-
-        kicked = (
-            new.status == enums.ChatMemberStatus.BANNED or
-            (old.status == enums.ChatMemberStatus.MEMBER and
-             new.status == enums.ChatMemberStatus.LEFT)
-        )
-        if not kicked:
-            return
-
-        actor = getattr(update, 'from_user', None)
-        if not actor:
-            return
-        actor_id = actor.id
-        if actor_id == OWNER_ID:
-            return
-
-        try:
-            actor_member = await app.get_chat_member(chat_id, actor_id)
-            if actor_member.status not in [
-                enums.ChatMemberStatus.ADMINISTRATOR,
-                enums.ChatMemberStatus.OWNER
-            ]:
-                return
-        except Exception:
-            return
-
-        now = _mono()
-        kick_tracker.setdefault(chat_id, {}).setdefault(actor_id, [])
-        kick_tracker[chat_id][actor_id] = [
-            t for t in kick_tracker[chat_id][actor_id] if now - t < KICK_WINDOW
-        ]
-        kick_tracker[chat_id][actor_id].append(now)
-
-        count = len(kick_tracker[chat_id][actor_id])
-        print(f"⚠️ [EVENT] Admin {actor_id} kick count: {count}/{KICK_THRESHOLD} in last {KICK_WINDOW}s")
-
-        if count >= KICK_THRESHOLD:
-            await _execute_mass_kick_demotion(
-                chat_id, actor_id,
-                getattr(actor, 'first_name', None) or str(actor_id),
-                count, source="EVENT"
-            )
-    except Exception as e:
-        print(f"❌ mass kick (event) error: {e}")
-
 
 @app.on_message(filters.new_chat_members)
 async def handle_new_group_member(client, message):
@@ -834,41 +621,20 @@ async def handle_new_group_member(client, message):
         print(f"👥 [MSG] {first_name} joined group")
         await instant_unmute_if_in_vc(chat_id, user_id, first_name, "Message")
 
-
-@app.on_message(filters.left_chat_member)
-async def handle_left_group_member(client, message):
-    chat_id = message.chat.id
-    if chat_id not in ALLOWED_GROUPS:
-        return
-    user_id = message.left_chat_member.id
-    first_name = message.left_chat_member.first_name or str(user_id)
-    print(f"👋 Left group: {first_name} ({user_id})")
-    remove_group_member(user_id, chat_id)
-
-
-# ============================================
-# ADMIN COMMANDS
-# ============================================
-
-async def _is_admin(chat_id, user_id):
-    if user_id == OWNER_ID:
-        return True
-    try:
-        m = await app.get_chat_member(chat_id, user_id)
-        return m.status in [
-            enums.ChatMemberStatus.ADMINISTRATOR,
-            enums.ChatMemberStatus.OWNER
-        ]
-    except Exception:
-        return False
-
-
 @app.on_message(filters.command("unmute") & filters.group)
 async def admin_unmute(client, message):
     chat_id = message.chat.id
     if chat_id not in ALLOWED_GROUPS:
         return
-    if not await _is_admin(chat_id, message.from_user.id):
+
+    try:
+        sender = await app.get_chat_member(chat_id, message.from_user.id)
+        if sender.status not in [
+            enums.ChatMemberStatus.ADMINISTRATOR,
+            enums.ChatMemberStatus.OWNER
+        ] and message.from_user.id != OWNER_ID:
+            return
+    except Exception:
         return
 
     if not message.reply_to_message or not message.reply_to_message.from_user:
@@ -879,11 +645,8 @@ async def admin_unmute(client, message):
     user_id = target.id
     first_name = target.first_name or str(user_id)
 
-    # Admin override clears every kind of mute record.
-    vc_video_users.get(chat_id, set()).discard(user_id)
+    video_muted.get(chat_id, set()).discard(user_id)
     remove_admin_mute(user_id, chat_id)
-    remove_bot_mute(user_id, chat_id)
-    pending_admin_mute.get(chat_id, {}).pop(user_id, None)
 
     success = await unmute_in_vc(chat_id, user_id)
     if success:
@@ -893,35 +656,15 @@ async def admin_unmute(client, message):
     else:
         await message.reply(f"⚠️ Could not unmute **{first_name}** — they may not be in VC.")
 
-
-@app.on_message(filters.command("mutestate") & filters.group)
-async def mute_state(client, message):
-    """Debug helper: shows exactly why a replied-to user is muted."""
+@app.on_message(filters.left_chat_member)
+async def handle_left_group_member(client, message):
     chat_id = message.chat.id
     if chat_id not in ALLOWED_GROUPS:
         return
-    if not await _is_admin(chat_id, message.from_user.id):
-        return
-    if not message.reply_to_message or not message.reply_to_message.from_user:
-        await message.reply("↩️ Reply to a user and use /mutestate")
-        return
-
-    uid = message.reply_to_message.from_user.id
-    users, _, video, force_muted = await get_vc_participants(chat_id)
-    await message.reply(
-        f"**Mute state for** `{uid}`\n"
-        f"• In VC: `{uid in users}`\n"
-        f"• Force-muted on Telegram: `{uid in force_muted}`\n"
-        f"• Admin mute record: `{is_admin_muted(uid, chat_id)}`\n"
-        f"• Bot mute record: `{get_bot_mute_reason(uid, chat_id)}`\n"
-        f"• Known group member (db): `{is_known_member(uid, chat_id)}`\n"
-        f"• Live member: `{await is_real_member(chat_id, uid)}`"
-    )
-
-
-# ============================================
-# VC JOIN HANDLING
-# ============================================
+    user_id = message.left_chat_member.id
+    first_name = message.left_chat_member.first_name or str(user_id)
+    print(f"👋 Left group: {first_name} ({user_id})")
+    remove_group_member(user_id, chat_id)
 
 async def _background_dp_check(chat_id, user_id, first_name):
     try:
@@ -935,7 +678,6 @@ async def _background_dp_check(chat_id, user_id, first_name):
             print(f"✅ DP clean: {first_name} ({user_id}) score={score}")
     except Exception as e:
         print(f"❌ _background_dp_check error {user_id}: {e}")
-
 
 async def handle_vc_join(chat_id, user_id):
     try:
@@ -965,7 +707,7 @@ async def handle_vc_join(chat_id, user_id):
             pass
 
         if has_group_link(bio):
-            await mute_in_vc(chat_id, user_id, reason="bio_link")
+            await mute_in_vc(chat_id, user_id)
             warns = add_warning(user_id, chat_id, first_name)
             if warns >= 3:
                 await app.ban_chat_member(chat_id, user_id)
@@ -980,19 +722,11 @@ async def handle_vc_join(chat_id, user_id):
 
         asyncio.create_task(_background_dp_check(chat_id, user_id, first_name))
 
-        # Real admin mute always wins.
         if is_admin_muted(user_id, chat_id):
             print(f"🔒 {first_name} was admin-muted before — re-muting on rejoin")
-            await mute_in_vc(chat_id, user_id, reason="admin_persist")
+            await mute_in_vc(chat_id, user_id)
             await send_log("🔒 Re-Muted (Admin Mute Persisted)", first_name, user_id, chat_id,
                 "User was previously muted by an admin — kept muted after rejoining VC")
-            return
-
-        # Sticky bot mutes (camera/screenshare, bio link) persist across rejoin too.
-        prev_reason = get_bot_mute_reason(user_id, chat_id)
-        if prev_reason in STICKY_REASONS:
-            print(f"🔒 {first_name} had a sticky bot mute ({prev_reason}) — re-muting")
-            await mute_in_vc(chat_id, user_id, reason=prev_reason)
             return
 
         member_ok = await is_real_member(chat_id, user_id)
@@ -1002,13 +736,12 @@ async def handle_vc_join(chat_id, user_id):
             await unmute_in_vc(chat_id, user_id)
         else:
             print(f"🔇 Not a member — muting: {first_name}")
-            await mute_in_vc(chat_id, user_id, reason="not_member")
+            await mute_in_vc(chat_id, user_id)
             await send_log("🔇 VC Muted", first_name, user_id, chat_id,
                 "User is not a group member")
 
     except Exception as e:
         print(f"❌ handle_vc_join error {user_id}: {e}")
-
 
 async def handle_channel_vc_join(chat_id, channel_id):
     try:
@@ -1073,145 +806,55 @@ async def handle_channel_vc_join(chat_id, channel_id):
     except Exception as e:
         print(f"❌ handle_channel_vc_join error {channel_id}: {e}")
 
-
 async def handle_video_screenshare(chat_id, user_id):
     try:
         if user_id == OWNER_ID:
             return
 
-        first_name = await get_name(user_id)
+        try:
+            user_info = await app.get_users(user_id)
+            first_name = getattr(user_info, 'first_name', None) or str(user_id)
+        except Exception:
+            first_name = str(user_id)
+
         print(f"📷 {first_name} ({user_id}) turned on camera/screenshare — muting!")
-        success = await mute_in_vc(chat_id, user_id, reason="video")
+        success = await mute_in_vc(chat_id, user_id)
         if success:
+            if chat_id not in video_muted:
+                video_muted[chat_id] = set()
+            video_muted[chat_id].add(user_id)
             await send_log("🔇 Muted (Camera/Screenshare)", first_name, user_id, chat_id,
                 "User turned on camera or screen share in VC — only admin can unmute")
 
     except Exception as e:
         print(f"❌ handle_video_screenshare error {user_id}: {e}")
 
-
-# ============================================
-# ADMIN-MUTE ATTRIBUTION  (restart-safe, race-safe)
-# ============================================
-
-async def adopt_existing_mutes(chat_id, force_muted):
-    """
-    Runs once at startup. Any user who is force-muted right now but has NO
-    ownership record gets adopted, so the detector below never mistakes an
-    old bot mute for a fresh admin mute (that mistake is what permanently
-    blocked unmuting before).
-    """
-    bot_mutes = get_all_bot_mutes(chat_id)
-    adopted, left_alone = 0, 0
-    for uid in force_muted:
-        if uid == OWNER_ID:
-            continue
-        if uid in bot_mutes or is_admin_muted(uid, chat_id):
-            continue
-        try:
-            member_ok = await is_real_member(chat_id, uid)
-        except Exception:
-            member_ok = False
-        if not member_ok:
-            # Non-member force-muted with no record => almost certainly our
-            # own pre-restart mute. Adopt it so it can be auto-cleared later.
-            add_bot_mute(uid, chat_id, "not_member")
-            adopted += 1
-        else:
-            # A MEMBER force-muted with no record => a human admin did it.
-            add_admin_mute(uid, chat_id)
-            left_alone += 1
-    print(f"🧾 Startup mute adoption for {chat_id}: {adopted} bot-owned, {left_alone} attributed to admins")
-
-
-async def detect_admin_mutes(chat_id, current_ids, force_muted):
-    """
-    Attribute a force-mute to a human admin only when ALL of these hold:
-      1. we have no bot_muted record for that user
-      2. we did not call mute/unmute on them within BOT_ACTION_GRACE seconds
-         (kills the stale-snapshot race)
-      3. the force-mute is still there after ADMIN_MUTE_CONFIRM_SECONDS
-    """
-    now_t = _mono()
-    bot_mutes = get_all_bot_mutes(chat_id)
-
-    candidates = set()
-    for uid in force_muted:
-        if uid == OWNER_ID:
-            continue
-        if uid in bot_mutes:
-            continue
-        if _in_bot_grace(chat_id, uid):
-            continue
-        candidates.add(uid)
-
-    pend = pending_admin_mute.setdefault(chat_id, {})
-
-    for uid in list(pend.keys()):
-        if uid not in candidates:
-            pend.pop(uid, None)
-
-    for uid in candidates:
-        pend.setdefault(uid, now_t)
-
-    for uid, first_seen in list(pend.items()):
-        if now_t - first_seen < ADMIN_MUTE_CONFIRM_SECONDS:
-            continue
-        if is_admin_muted(uid, chat_id):
-            continue
-        add_admin_mute(uid, chat_id)
-        fname = await get_name(uid)
-        print(f"🔒 Admin force-mute confirmed: {fname} ({uid}) — will stay muted on rejoin")
-        await send_log("🔒 Admin Mute Detected", fname, uid, chat_id,
-            "Admin muted this user in VC — bot will keep them muted if they leave and rejoin")
-
-    # Lift an admin mute only when the user is actually present in the VC and
-    # is visibly un-force-muted (i.e. an admin really did unmute them).
-    for uid in get_admin_muted_users(chat_id):
-        if uid not in current_ids:
-            continue          # not in VC — keep the record for rejoin
-        if uid in force_muted:
-            continue          # still muted
-        if _in_bot_grace(chat_id, uid):
-            continue          # our own call, snapshot may be stale
-        remove_admin_mute(uid, chat_id)
-        remove_bot_mute(uid, chat_id)
-        print(f"🔓 Admin force-mute lifted for {uid}")
-
-
-# ============================================
-# POLLERS
-# ============================================
-
 async def poll_vc():
     print("🎙️ VC Polling started!")
     for chat_id in ALLOWED_GROUPS:
-        initial_users, initial_channels, initial_video, initial_force_muted = await get_vc_participants(chat_id)
+        initial_users, initial_channels, initial_video, initial_admin_muted = await get_vc_participants(chat_id)
         vc_members[chat_id] = initial_users
         vc_channels[chat_id] = initial_channels
         vc_video_users[chat_id] = initial_video
-        pending_admin_mute[chat_id] = {}
-        # Rebuild the in-memory mirror from the persistent table — NOT from an
-        # empty set like the old code did.
-        muted_in_vc[chat_id] = set(get_all_bot_mutes(chat_id).keys())
-        await adopt_existing_mutes(chat_id, initial_force_muted)
-        print(f"📌 Startup: {len(initial_users)} users, {len(initial_channels)} channels in VC, "
-              f"{len(muted_in_vc[chat_id])} bot-owned mutes restored")
+        vc_admin_muted[chat_id] = set()  # populated below, on purpose starts empty
+        muted_in_vc[chat_id] = set()
+        print(f"📌 Startup: {len(initial_users)} users, {len(initial_channels)} channels in VC")
 
     while True:
         try:
             for chat_id in ALLOWED_GROUPS:
-                current_ids, current_channels, current_video, current_force_muted = await get_vc_participants(chat_id)
+                current_ids, current_channels, current_video, current_admin_muted = await get_vc_participants(chat_id)
 
                 previous_ids = vc_members.get(chat_id, set())
                 new_joiners = current_ids - previous_ids
                 left_vc = previous_ids - current_ids
 
                 for uid in left_vc:
+                    muted_in_vc.get(chat_id, set()).discard(uid)
                     vc_video_users.get(chat_id, set()).discard(uid)
-                    pending_admin_mute.get(chat_id, {}).pop(uid, None)
-                    # Mute records are deliberately NOT cleared here — they must
-                    # survive leave/rejoin for both admin mutes and sticky mutes.
+                    video_muted.get(chat_id, set()).discard(uid)
+                    # NOTE: we deliberately do NOT clear admin_muted persistence
+                    # here — that's the whole point, it must survive leave/rejoin.
 
                 for user_id in new_joiners:
                     print(f"🆕 New VC joiner: {user_id}")
@@ -1219,7 +862,29 @@ async def poll_vc():
 
                 vc_members[chat_id] = current_ids
 
-                await detect_admin_mutes(chat_id, current_ids, current_force_muted)
+                # --- Admin force-mute tracking (persists across leave/rejoin) ---
+                previous_admin_muted = vc_admin_muted.get(chat_id, set())
+                # Only count it as "an admin did this" if the bot itself didn't
+                # just mute them (bot mutes are tracked in muted_in_vc).
+                newly_force_muted = (current_admin_muted - previous_admin_muted) - muted_in_vc.get(chat_id, set())
+                no_longer_force_muted = previous_admin_muted - current_admin_muted
+
+                for uid in newly_force_muted:
+                    add_admin_mute(uid, chat_id)
+                    try:
+                        info = await app.get_users(uid)
+                        fname = getattr(info, 'first_name', None) or str(uid)
+                    except Exception:
+                        fname = str(uid)
+                    print(f"🔒 Admin force-mute detected: {fname} ({uid}) — will stay muted on rejoin")
+                    await send_log("🔒 Admin Mute Detected", fname, uid, chat_id,
+                        "Admin muted this user in VC — bot will keep them muted if they leave and rejoin")
+
+                for uid in no_longer_force_muted:
+                    remove_admin_mute(uid, chat_id)
+                    print(f"🔓 Admin force-mute lifted: {uid}")
+
+                vc_admin_muted[chat_id] = current_admin_muted
 
                 previous_channels = vc_channels.get(chat_id, set())
                 new_channels = current_channels - previous_channels
@@ -1244,57 +909,131 @@ async def poll_vc():
 
         await asyncio.sleep(2)
 
-
 async def poll_muted_users():
-    """
-    Reconciler. Works off the LIVE VC participant list plus the persistent
-    bot_muted table, so it still fires after a restart, after a missed
-    ChatMemberUpdated event, or if the user joined the group silently.
-    Admin mutes and sticky mutes are never touched here.
-    """
-    print("🔄 Muted-user reconciler started!")
+    print("🔄 Muted-user poller started!")
     while True:
         try:
             for chat_id in ALLOWED_GROUPS:
-                current_ids, _, _, force_muted = await get_vc_participants(chat_id)
-                if not current_ids:
-                    continue
+                muted_set = muted_in_vc.get(chat_id, set()).copy()
+                for user_id in muted_set:
+                    if user_id in video_muted.get(chat_id, set()):
+                        continue
 
-                bot_mutes = get_all_bot_mutes(chat_id)
-
-                for user_id, reason in bot_mutes.items():
-                    if user_id not in current_ids:
-                        continue                       # not in VC right now
-                    if reason not in AUTO_CLEARABLE_REASONS:
-                        continue                       # video / bio_link / admin_persist
                     if is_admin_muted(user_id, chat_id):
-                        continue                       # admin owns this mute
-                    if user_id not in force_muted:
-                        # someone already unmuted them — drop our stale record
-                        remove_bot_mute(user_id, chat_id)
                         continue
 
-                    # Live membership check (falls back to the local cache on error).
+                    if is_known_member(user_id, chat_id):
+                        try:
+                            user_info = await app.get_users(user_id)
+                            first_name = getattr(user_info, 'first_name', None) or str(user_id)
+                        except Exception:
+                            first_name = str(user_id)
+                        print(f"🔄 [POLL] {first_name} ({user_id}) is now a member — unmuting!")
+                        success = await unmute_in_vc(chat_id, user_id)
+                        if success:
+                            await send_log("🔊 Auto Unmuted (Poll)", first_name, user_id, chat_id,
+                                "Joined group while sitting in VC (detected by poller)")
+                        continue
+
                     try:
-                        member_ok = await is_real_member(chat_id, user_id)
-                    except Exception:
-                        member_ok = is_known_member(user_id, chat_id)
-
-                    if not member_ok:
-                        continue
-
-                    first_name = await get_name(user_id)
-                    print(f"🔄 [RECONCILE] {first_name} ({user_id}) is now a member — unmuting!")
-                    success = await unmute_in_vc(chat_id, user_id)
-                    if success:
-                        await send_log("🔊 Auto Unmuted (Reconciler)", first_name, user_id, chat_id,
-                            "User joined the group while sitting in VC — mute lifted")
+                        member = await app.get_chat_member(chat_id, user_id)
+                        status = member.status
+                        is_restricted_member = (
+                            status == enums.ChatMemberStatus.RESTRICTED
+                            and getattr(member, 'is_member', False)
+                        )
+                        if status in [
+                            enums.ChatMemberStatus.MEMBER,
+                            enums.ChatMemberStatus.ADMINISTRATOR,
+                            enums.ChatMemberStatus.OWNER,
+                        ] or is_restricted_member:
+                            try:
+                                user_info = await app.get_users(user_id)
+                                first_name = getattr(user_info, 'first_name', None) or str(user_id)
+                            except Exception:
+                                first_name = str(user_id)
+                            print(f"🔄 [POLL] {first_name} ({user_id}) became a member — unmuting!")
+                            save_group_member(user_id, chat_id)
+                            success = await unmute_in_vc(chat_id, user_id)
+                            if success:
+                                await send_log("🔊 Auto Unmuted (Poll)", first_name, user_id, chat_id,
+                                    "Joined group while sitting in VC (detected by poller)")
+                    except Exception as e:
+                        if "USER_NOT_PARTICIPANT" not in str(e):
+                            print(f"❌ Muted poller check error for {user_id}: {e}")
 
         except Exception as e:
-            print(f"❌ Reconciler error: {e}")
+            print(f"❌ Muted poller error: {e}")
 
         await asyncio.sleep(3)
 
+@app.on_chat_member_updated()
+async def anti_mass_kick_monitor(client, update):
+    """
+    Kept as a best-effort backup. May not fire reliably for bans performed by
+    other admins on a pyrogram userbot session — see poll_admin_kick_log()
+    below, which is the reliable path and does not depend on this handler.
+    """
+    try:
+        chat_id = update.chat.id
+        if chat_id not in ALLOWED_GROUPS:
+            return
+
+        old = update.old_chat_member
+        new = update.new_chat_member
+        if not old or not new:
+            return
+
+        old_status = old.status
+        new_status = new.status
+
+        kicked = (
+            new_status == enums.ChatMemberStatus.BANNED or
+            (old_status == enums.ChatMemberStatus.MEMBER and
+             new_status == enums.ChatMemberStatus.LEFT)
+        )
+        if not kicked:
+            return
+
+        actor = getattr(update, 'from_user', None)
+        if not actor:
+            return
+        actor_id = actor.id
+
+        if actor_id == OWNER_ID:
+            return
+
+        try:
+            actor_member = await app.get_chat_member(chat_id, actor_id)
+            if actor_member.status not in [
+                enums.ChatMemberStatus.ADMINISTRATOR,
+                enums.ChatMemberStatus.OWNER
+            ]:
+                return
+        except Exception:
+            return
+
+        now = asyncio.get_event_loop().time()
+        if chat_id not in kick_tracker:
+            kick_tracker[chat_id] = {}
+        if actor_id not in kick_tracker[chat_id]:
+            kick_tracker[chat_id][actor_id] = []
+
+        kick_tracker[chat_id][actor_id] = [
+            t for t in kick_tracker[chat_id][actor_id]
+            if now - t < KICK_WINDOW
+        ]
+        kick_tracker[chat_id][actor_id].append(now)
+
+        count = len(kick_tracker[chat_id][actor_id])
+        print(f"⚠️ [EVENT] Admin {actor_id} kick count: {count}/{KICK_THRESHOLD} in last {KICK_WINDOW}s")
+
+        if count >= KICK_THRESHOLD:
+            await _execute_mass_kick_demotion(chat_id, actor_id,
+                getattr(actor, 'first_name', None) or str(actor_id), count, source="EVENT")
+
+    except Exception as e:
+        print(f"❌ anti_mass_kick_monitor error: {e}")
 
 # ============================================
 # 🛡️ ANTI-MASS-KICK — RELIABLE ADMIN LOG POLLER
@@ -1302,10 +1041,11 @@ async def poll_muted_users():
 # pyrogram==2.0.106 userbot sessions do not reliably receive ChatMemberUpdated
 # push-updates for ban/kick actions performed by OTHER admins. This poller
 # pulls the channel admin log directly (channels.GetAdminLog), which does not
-# depend on update dispatch at all.
+# depend on update dispatch at all — same proven pattern as poll_vc() above.
 #
 # REQUIRES: the userbot account must be an admin with full admin rights in the
-# group (not a restricted/limited admin) to call GetAdminLog.
+# group (not a restricted/limited admin) to call GetAdminLog. If it lacks
+# permission, you'll see a "lacks admin-log permission" warning in logs below.
 
 async def _execute_mass_kick_demotion(chat_id, actor_id, actor_name, count, source="LOG-POLL"):
     """Shared demote + alert logic, called by either detection path."""
@@ -1357,6 +1097,22 @@ async def _execute_mass_kick_demotion(chat_id, actor_id, actor_name, count, sour
 
 async def poll_admin_kick_log():
     print("🛡️ Admin-action log poller started!")
+
+    def _is_genuine_ban_event(action) -> bool:
+        """
+        ChannelAdminLogEventActionParticipantToggleBan fires for ANY change to
+        a participant's banned/restricted state — including an admin muting or
+        restricting a spammer's messaging rights (still a member), or UNDOING
+        a previous ban. None of those are an actual kick. Only count it as a
+        real removal-from-chat if the new state is ChannelParticipantBanned
+        with left=True (Telegram's actual "kicked out" flag).
+        """
+        new_p = getattr(action, 'new_participant', None)
+        if new_p is None:
+            return False
+        if type(new_p).__name__ != 'ChannelParticipantBanned':
+            return False
+        return bool(getattr(new_p, 'left', False))
 
     # Initialize last_event_log_id so we don't replay old history on startup
     for chat_id in ALLOWED_GROUPS:
@@ -1430,7 +1186,7 @@ async def poll_admin_kick_log():
                     except Exception:
                         continue
 
-                    now = _mono()
+                    now = asyncio.get_event_loop().time()
                     kick_tracker.setdefault(chat_id, {}).setdefault(actor_id, [])
                     kick_tracker[chat_id][actor_id] = [
                         t for t in kick_tracker[chat_id][actor_id]
@@ -1451,16 +1207,12 @@ async def poll_admin_kick_log():
 
         await asyncio.sleep(EVENT_LOG_POLL_INTERVAL)
 
-
-# ============================================
-# STARTUP
-# ============================================
-
 async def _register_log_channel(label, chat_id, invite_link):
     """
     Resolve a private log channel's peer. Private channels have no @username,
-    so if get_chat() fails with 'Peer id invalid', fall back to joining via
-    invite link, which always bootstraps the peer cache.
+    so if get_chat() fails with 'Peer id invalid' (peer/access_hash not yet
+    cached by this session), fall back to joining via invite link, which
+    always bootstraps the peer cache regardless of prior session state.
     """
     for attempt in range(5):
         try:
@@ -1484,6 +1236,8 @@ async def _register_log_channel(label, chat_id, invite_link):
         joined = await app.join_chat(invite_link)
         print(f"✅ {label} joined via invite link: {joined.title}")
     except Exception as e:
+        # UserAlreadyParticipant / already-joined errors are fine here —
+        # the point is just to force the peer into the session cache.
         print(f"⚠️ {label} join_chat error (may already be a member): {e}")
 
     try:
@@ -1498,7 +1252,6 @@ async def _register_log_channel(label, chat_id, invite_link):
     except Exception as e:
         print(f"❌ {label} still unresolvable after invite join: {e}")
         return False
-
 
 async def main():
     await app.start()
@@ -1550,4 +1303,5 @@ async def main():
     await asyncio.Event().wait()
 
 init_db()
-app.run(main())
+loop = asyncio.get_event_loop()
+loop.run_until_complete(main())
