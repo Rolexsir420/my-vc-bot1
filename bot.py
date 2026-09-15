@@ -71,6 +71,18 @@ app = Client(
 # is only attributed to an admin when it is NOT ours, is not within the
 # grace window of one of our own API calls, and is still present after a
 # confirmation delay (kills the snapshot race).
+#
+# SECOND RACE (join-grace fix, added below):
+# When an admin-muted user LEAVES the VC and REJOINS, poll_vc() schedules
+# handle_vc_join() as a background task (which will see is_admin_muted()
+# and re-mute them) AND, in the same tick, calls detect_admin_mutes() using
+# a VC snapshot taken BEFORE that re-mute has actually landed on Telegram's
+# side. At that instant the rejoined user looks unmuted, so the "lift admin
+# mute" logic concludes a human must have unmuted them and deletes the
+# admin_muted record — right before handle_vc_join's re-mute would have
+# used it. recent_vc_join / _in_join_grace() closes this: any user who
+# (re)joined the VC within JOIN_GRACE_SECONDS is never eligible to have
+# their admin mute lifted, giving the re-mute time to actually land.
 # ============================================================
 
 # Reasons that the bot itself is allowed to auto-clear once the user
@@ -81,6 +93,7 @@ STICKY_REASONS = {"video", "bio_link"}
 
 ADMIN_MUTE_CONFIRM_SECONDS = 6   # force-mute must persist this long before we call it an admin mute
 BOT_ACTION_GRACE = 12            # ignore force-mute state this soon after our own mute/unmute call
+JOIN_GRACE_SECONDS = 8           # ignore "looks unmuted" state this soon after a VC (re)join
 
 vc_members = {}
 muted_in_vc = {}          # in-memory mirror of bot_muted, rebuilt from DB on startup
@@ -88,6 +101,7 @@ vc_channels = {}
 vc_video_users = {}
 pending_admin_mute = {}   # {chat_id: {user_id: first_seen_monotonic}}
 recent_bot_action = {}    # {(chat_id, user_id): monotonic} — set on every bot mute/unmute
+recent_vc_join = {}       # {(chat_id, user_id): monotonic} — set every time someone is seen (re)joining the VC
 
 kick_tracker = {}
 KICK_THRESHOLD = 10
@@ -130,6 +144,26 @@ def _mark_bot_action(chat_id, user_id):
 def _in_bot_grace(chat_id, user_id):
     ts = recent_bot_action.get((chat_id, user_id))
     return ts is not None and (_mono() - ts) < BOT_ACTION_GRACE
+
+
+def _mark_vc_join(chat_id, user_id):
+    """Called the moment poll_vc() sees a user (re)appear in the VC —
+    BEFORE handle_vc_join() has had a chance to actually re-apply any
+    mute it owes them. Starts the join-grace window."""
+    recent_vc_join[(chat_id, user_id)] = _mono()
+
+
+def _in_join_grace(chat_id, user_id):
+    """True if this user (re)joined the VC within the last
+    JOIN_GRACE_SECONDS. Self-cleans expired entries so the dict doesn't
+    grow unbounded over a long-running process."""
+    ts = recent_vc_join.get((chat_id, user_id))
+    if ts is None:
+        return False
+    if (_mono() - ts) >= JOIN_GRACE_SECONDS:
+        recent_vc_join.pop((chat_id, user_id), None)
+        return False
+    return True
 
 
 async def get_cached_call(chat_id):
@@ -915,7 +949,8 @@ async def mute_state(client, message):
         f"• Admin mute record: `{is_admin_muted(uid, chat_id)}`\n"
         f"• Bot mute record: `{get_bot_mute_reason(uid, chat_id)}`\n"
         f"• Known group member (db): `{is_known_member(uid, chat_id)}`\n"
-        f"• Live member: `{await is_real_member(chat_id, uid)}`"
+        f"• Live member: `{await is_real_member(chat_id, uid)}`\n"
+        f"• In join-grace window: `{_in_join_grace(chat_id, uid)}`"
     )
 
 
@@ -1131,6 +1166,13 @@ async def detect_admin_mutes(chat_id, current_ids, force_muted):
       2. we did not call mute/unmute on them within BOT_ACTION_GRACE seconds
          (kills the stale-snapshot race)
       3. the force-mute is still there after ADMIN_MUTE_CONFIRM_SECONDS
+
+    Lifting an existing admin mute additionally requires that the user is
+    NOT inside a fresh join-grace window (see _in_join_grace) — otherwise a
+    rejoining admin-muted user, whose re-mute from handle_vc_join() hasn't
+    landed on Telegram's side yet in this same tick, would look "unmuted"
+    and have their admin_muted record wrongly deleted right before the
+    re-mute needed it.
     """
     now_t = _mono()
     bot_mutes = get_all_bot_mutes(chat_id)
@@ -1165,8 +1207,10 @@ async def detect_admin_mutes(chat_id, current_ids, force_muted):
         await send_log("🔒 Admin Mute Detected", fname, uid, chat_id,
             "Admin muted this user in VC — bot will keep them muted if they leave and rejoin")
 
-    # Lift an admin mute only when the user is actually present in the VC and
-    # is visibly un-force-muted (i.e. an admin really did unmute them).
+    # Lift an admin mute only when the user is actually present in the VC,
+    # is visibly un-force-muted, is outside our own action grace window,
+    # AND is outside the join-grace window (i.e. this isn't just a rejoin
+    # whose re-mute hasn't applied yet).
     for uid in get_admin_muted_users(chat_id):
         if uid not in current_ids:
             continue          # not in VC — keep the record for rejoin
@@ -1174,6 +1218,8 @@ async def detect_admin_mutes(chat_id, current_ids, force_muted):
             continue          # still muted
         if _in_bot_grace(chat_id, uid):
             continue          # our own call, snapshot may be stale
+        if _in_join_grace(chat_id, uid):
+            continue          # just (re)joined — give the re-mute time to land
         remove_admin_mute(uid, chat_id)
         remove_bot_mute(uid, chat_id)
         print(f"🔓 Admin force-mute lifted for {uid}")
@@ -1215,6 +1261,12 @@ async def poll_vc():
 
                 for user_id in new_joiners:
                     print(f"🆕 New VC joiner: {user_id}")
+                    # Start the join-grace window BEFORE the background task
+                    # even runs, so this tick's detect_admin_mutes() call
+                    # (below) already knows this user just (re)appeared and
+                    # won't lift an admin mute out from under the re-mute
+                    # that handle_vc_join() is about to schedule.
+                    _mark_vc_join(chat_id, user_id)
                     asyncio.create_task(handle_vc_join(chat_id, user_id))
 
                 vc_members[chat_id] = current_ids
