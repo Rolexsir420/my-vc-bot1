@@ -1328,6 +1328,30 @@ async def poll_vc():
             for chat_id in ALLOWED_GROUPS:
                 current_ids, current_channels, current_video, current_force_muted = await get_vc_participants(chat_id)
 
+                # ---- external video-mute release detector ----
+                # Catches an admin unmuting the user's mic directly from
+                # Telegram's own VC participant list instead of running
+                # /unmute. Without this, get_bot_mute_reason() still says
+                # "video" and handle_vc_join() re-mutes them on the next
+                # leave/rejoin even though a human already let them talk.
+                # This fires for ANY route the force-mute disappears by,
+                # as long as it wasn't OUR call (bot-action grace window).
+                for uid, reason in get_all_bot_mutes(chat_id).items():
+                    if reason != "video":
+                        continue
+                    if uid not in current_ids:
+                        continue                       # not in VC right now
+                    if uid in current_force_muted:
+                        continue                       # still muted, nothing changed
+                    if _in_bot_grace(chat_id, uid):
+                        continue                       # this IS our own unmute landing
+                    fname = await get_name(uid)
+                    print(f"✅ Video mute externally released for {fname} ({uid}) — granting exemption")
+                    add_video_exempt(uid, chat_id)
+                    remove_bot_mute(uid, chat_id)
+                    await send_log("✅ Video Mute Lifted (Admin)", fname, uid, chat_id,
+                        "Mic unmuted directly in VC (not via /unmute) — camera-mute exemption granted")
+
                 previous_ids = vc_members.get(chat_id, set())
                 new_joiners = current_ids - previous_ids
                 left_vc = previous_ids - current_ids
