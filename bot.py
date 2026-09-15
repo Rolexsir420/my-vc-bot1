@@ -113,6 +113,7 @@ vc_members = {}
 muted_in_vc = {}          # in-memory mirror of bot_muted, rebuilt from DB on startup
 vc_channels = {}
 vc_video_users = {}
+vc_force_muted = {}       # {chat_id: set(uid)} — last-known force-mute state per user, per tick
 pending_admin_mute = {}   # {chat_id: {user_id: first_seen_monotonic}}
 recent_bot_action = {}    # {(chat_id, user_id): monotonic} — set on every bot mute/unmute
 recent_vc_join = {}       # {(chat_id, user_id): monotonic} — set every time someone is seen (re)joining the VC
@@ -1324,6 +1325,7 @@ async def poll_vc():
         vc_members[chat_id] = initial_users
         vc_channels[chat_id] = initial_channels
         vc_video_users[chat_id] = initial_video
+        vc_force_muted[chat_id] = initial_force_muted
         pending_admin_mute[chat_id] = {}
         # Rebuild the in-memory mirror from the persistent table — NOT from an
         # empty set like the old code did.
@@ -1362,6 +1364,7 @@ async def poll_vc():
                         "Mic unmuted directly in VC (not via /unmute) — camera-mute exemption granted")
 
                 previous_ids = vc_members.get(chat_id, set())
+                previous_force_muted = vc_force_muted.get(chat_id, set())
                 new_joiners = current_ids - previous_ids
                 left_vc = previous_ids - current_ids
 
@@ -1372,6 +1375,25 @@ async def poll_vc():
                     # survive leave/rejoin for both admin mutes and sticky mutes.
                     # (video_exempt is also deliberately left alone here — an
                     # admin's excuse should survive a leave/rejoin too.)
+                    #
+                    # BUT: if our bot_muted record still says "video" while the
+                    # user's LAST KNOWN state (from the previous tick, before
+                    # they left) was already unmuted, that record is stale — an
+                    # admin must have unmuted their mic directly via Telegram's
+                    # own VC UI (not /unmute) and then they left before the
+                    # in-call reconciler below had a chance to observe it and
+                    # grant the exemption. Catch it here at leave time instead,
+                    # so the stale "video" reason doesn't cause a wrongful
+                    # re-mute the next time they rejoin.
+                    stale_reason = get_bot_mute_reason(uid, chat_id)
+                    if (stale_reason == "video"
+                            and uid not in previous_force_muted
+                            and not _in_bot_grace(chat_id, uid)):
+                        add_video_exempt(uid, chat_id)
+                        remove_bot_mute(uid, chat_id)
+                        fname = await get_name(uid)
+                        print(f"✅ {fname} ({uid}) left VC already unmuted — "
+                              f"granting video exemption before rejoin")
 
                 for user_id in new_joiners:
                     print(f"🆕 New VC joiner: {user_id}")
@@ -1416,6 +1438,7 @@ async def poll_vc():
                     asyncio.create_task(handle_video_screenshare(chat_id, user_id))
 
                 vc_video_users[chat_id] = current_video
+                vc_force_muted[chat_id] = current_force_muted
 
         except Exception as e:
             print(f"❌ Poll error: {e}")
