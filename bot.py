@@ -978,7 +978,16 @@ async def admin_unmute(client, message):
         add_video_exempt(user_id, chat_id)
 
     # Admin override clears every kind of mute record.
-    vc_video_users.get(chat_id, set()).discard(user_id)
+    #
+    # NOTE: we deliberately do NOT touch vc_video_users here. It must keep
+    # reflecting whatever the camera/screenshare state actually is. If we
+    # discard the user from it while their camera is still on, the next
+    # poll_vc() tick sees them "newly" appear in current_video (since they
+    # were removed from previous_video) even though nothing changed, treats
+    # it as a fresh toggle-on event, and immediately re-mutes them — undoing
+    # this very unmute within ~2 seconds. vc_video_users is fully rebuilt
+    # from live data every poll tick anyway, so there's nothing to clean up
+    # here.
     remove_admin_mute(user_id, chat_id)
     remove_bot_mute(user_id, chat_id)
     pending_admin_mute.get(chat_id, {}).pop(user_id, None)
