@@ -83,6 +83,20 @@ app = Client(
 # used it. recent_vc_join / _in_join_grace() closes this: any user who
 # (re)joined the VC within JOIN_GRACE_SECONDS is never eligible to have
 # their admin mute lifted, giving the re-mute time to actually land.
+#
+# THIRD RACE (video-exempt fix, added below):
+# An admin running /unmute on a user who was muted for camera/screenshare
+# clears the bot_muted + admin_muted records, but does nothing about the
+# camera being on. poll_vc()'s screenshare detector is a pure diff against
+# the PREVIOUS poll tick's video-user set. The moment that user leaves the
+# VC (even briefly) and rejoins with the camera still on, they vanish from
+# vc_video_users on leave and reappear as a "new" video join on rejoin —
+# so they get muted again immediately, undoing the admin's unmute. A
+# persistent `video_exempt` record fixes this: set the instant an admin
+# clears a video mute, checked before ever re-muting for video, and only
+# cleared by a genuine camera off→on toggle while the user stays in the
+# call the whole time (never by a leave/rejoin, since that isn't a new
+# violation).
 # ============================================================
 
 # Reasons that the bot itself is allowed to auto-clear once the user
@@ -244,6 +258,18 @@ def init_db():
             PRIMARY KEY (user_id, chat_id)
         )
     """)
+    # NEW: persistent record of an admin-cleared video/screenshare mute.
+    # Prevents the leave/rejoin race from re-muting someone the admin
+    # already excused, until they genuinely toggle their camera off and
+    # back on again while remaining in the call.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS video_exempt (
+            user_id     INTEGER,
+            chat_id     INTEGER,
+            exempted_at TEXT,
+            PRIMARY KEY (user_id, chat_id)
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -382,6 +408,36 @@ def get_all_bot_mutes(chat_id):
     ).fetchall()
     conn.close()
     return {r[0]: r[1] for r in rows}
+
+# ---------- video_exempt helpers (NEW) ----------
+
+def add_video_exempt(user_id, chat_id):
+    conn = sqlite3.connect("warnings.db")
+    c = conn.cursor()
+    now = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
+    c.execute(
+        "INSERT OR REPLACE INTO video_exempt (user_id, chat_id, exempted_at) VALUES (?, ?, ?)",
+        (user_id, chat_id, now)
+    )
+    conn.commit()
+    conn.close()
+
+def remove_video_exempt(user_id, chat_id):
+    conn = sqlite3.connect("warnings.db")
+    c = conn.cursor()
+    c.execute("DELETE FROM video_exempt WHERE user_id=? AND chat_id=?", (user_id, chat_id))
+    conn.commit()
+    conn.close()
+
+def is_video_exempt(user_id, chat_id):
+    conn = sqlite3.connect("warnings.db")
+    c = conn.cursor()
+    result = c.execute(
+        "SELECT 1 FROM video_exempt WHERE user_id=? AND chat_id=?",
+        (user_id, chat_id)
+    ).fetchone()
+    conn.close()
+    return result is not None
 
 
 # ============================================
@@ -913,6 +969,14 @@ async def admin_unmute(client, message):
     user_id = target.id
     first_name = target.first_name or str(user_id)
 
+    # If this was a camera/screenshare mute, remember that an admin excused
+    # it BEFORE clearing the record, so a later leave/rejoin with the camera
+    # still on doesn't immediately re-trigger the mute (see video_exempt
+    # note at the top of the file).
+    prev_reason = get_bot_mute_reason(user_id, chat_id)
+    if prev_reason == "video":
+        add_video_exempt(user_id, chat_id)
+
     # Admin override clears every kind of mute record.
     vc_video_users.get(chat_id, set()).discard(user_id)
     remove_admin_mute(user_id, chat_id)
@@ -948,6 +1012,7 @@ async def mute_state(client, message):
         f"• Force-muted on Telegram: `{uid in force_muted}`\n"
         f"• Admin mute record: `{is_admin_muted(uid, chat_id)}`\n"
         f"• Bot mute record: `{get_bot_mute_reason(uid, chat_id)}`\n"
+        f"• Video-exempt (admin-cleared): `{is_video_exempt(uid, chat_id)}`\n"
         f"• Known group member (db): `{is_known_member(uid, chat_id)}`\n"
         f"• Live member: `{await is_real_member(chat_id, uid)}`\n"
         f"• In join-grace window: `{_in_join_grace(chat_id, uid)}`"
@@ -1023,12 +1088,16 @@ async def handle_vc_join(chat_id, user_id):
                 "User was previously muted by an admin — kept muted after rejoining VC")
             return
 
-        # Sticky bot mutes (camera/screenshare, bio link) persist across rejoin too.
+        # Sticky bot mutes (camera/screenshare, bio link) persist across rejoin too,
+        # UNLESS an admin has explicitly excused a video mute (video_exempt).
         prev_reason = get_bot_mute_reason(user_id, chat_id)
         if prev_reason in STICKY_REASONS:
-            print(f"🔒 {first_name} had a sticky bot mute ({prev_reason}) — re-muting")
-            await mute_in_vc(chat_id, user_id, reason=prev_reason)
-            return
+            if prev_reason == "video" and is_video_exempt(user_id, chat_id):
+                print(f"✅ {first_name} has an admin video-exemption — not re-muting on rejoin")
+            else:
+                print(f"🔒 {first_name} had a sticky bot mute ({prev_reason}) — re-muting")
+                await mute_in_vc(chat_id, user_id, reason=prev_reason)
+                return
 
         member_ok = await is_real_member(chat_id, user_id)
 
@@ -1112,6 +1181,16 @@ async def handle_channel_vc_join(chat_id, channel_id):
 async def handle_video_screenshare(chat_id, user_id):
     try:
         if user_id == OWNER_ID:
+            return
+
+        # An admin already excused this user's camera/screenshare mute.
+        # Do NOT re-mute — the exemption is only cleared by a genuine
+        # off→on camera toggle while the user stays in the call (handled
+        # in poll_vc(), which clears the exemption before calling this
+        # function for that specific case).
+        if is_video_exempt(user_id, chat_id):
+            first_name = await get_name(user_id)
+            print(f"✅ {first_name} ({user_id}) has an admin video-exemption — skipping mute")
             return
 
         first_name = await get_name(user_id)
@@ -1258,6 +1337,8 @@ async def poll_vc():
                     pending_admin_mute.get(chat_id, {}).pop(uid, None)
                     # Mute records are deliberately NOT cleared here — they must
                     # survive leave/rejoin for both admin mutes and sticky mutes.
+                    # (video_exempt is also deliberately left alone here — an
+                    # admin's excuse should survive a leave/rejoin too.)
 
                 for user_id in new_joiners:
                     print(f"🆕 New VC joiner: {user_id}")
@@ -1285,8 +1366,20 @@ async def poll_vc():
                 previous_video = vc_video_users.get(chat_id, set())
                 new_video = current_video - previous_video
 
+                # Split camera-on events into two kinds:
+                #   - rejoin_video: user just (re)appeared in the VC this tick
+                #     with the camera already on. This is NOT a new violation —
+                #     handle_video_screenshare() will itself check video_exempt
+                #     and skip the mute if an admin already excused them.
+                #   - toggle_video: user was already sitting in the VC and just
+                #     switched the camera on. This IS a genuine new violation,
+                #     so any admin exemption is cleared before muting again.
                 for user_id in new_video:
-                    print(f"📷 Video/screenshare detected: {user_id}")
+                    if user_id in new_joiners:
+                        print(f"📷 Video already on for rejoining user: {user_id} (checking exemption)")
+                    else:
+                        print(f"📷 Video/screenshare toggled on: {user_id} (genuine new violation)")
+                        remove_video_exempt(user_id, chat_id)
                     asyncio.create_task(handle_video_screenshare(chat_id, user_id))
 
                 vc_video_users[chat_id] = current_video
