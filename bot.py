@@ -1104,6 +1104,7 @@ async def handle_vc_join(chat_id, user_id):
         if prev_reason in STICKY_REASONS:
             if prev_reason == "video" and is_video_exempt(user_id, chat_id):
                 print(f"✅ {first_name} has an admin video-exemption — not re-muting on rejoin")
+                return
             else:
                 print(f"🔒 {first_name} had a sticky bot mute ({prev_reason}) — re-muting")
                 await mute_in_vc(chat_id, user_id, reason=prev_reason)
